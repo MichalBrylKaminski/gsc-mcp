@@ -1,0 +1,35 @@
+services:
+  gsc-mcp:
+    build: .
+    image: gsc-mcp:latest
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      GOOGLE_APPLICATION_CREDENTIALS: /run/secrets/gsc-sa.json
+      DATA_DIR: /data
+    secrets:
+      - gsc-sa.json
+    volumes:
+      - gsc-data:/data
+    # Localhost only: put your TLS reverse proxy (Caddy, Traefik, nginx) in front.
+    ports:
+      - "127.0.0.1:${HOST_PORT:-3000}:3000"
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "5"
+
+secrets:
+  gsc-sa.json:
+    file: ./secrets/gsc-sa.json
+
+volumes:
+  gsc-data:
