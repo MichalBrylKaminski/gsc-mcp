@@ -16,7 +16,7 @@ A read-only [MCP](https://modelcontextprotocol.io) server for the **Google Searc
 | `get_sitemap` | sitemaps.get | One sitemap |
 | `search_analytics_query` | searchanalytics.query | Clicks, impressions, CTR and position, with all dimensions, filters, search types, aggregation types and data states. `fetchAll` pages automatically |
 | `inspect_url` | urlInspection.index.inspect | Google's indexed view of one URL |
-| `batch_inspect_urls` | urlInspection.index.inspect | Up to 25 URLs, with a compact summary of each |
+| `batch_inspect_urls` | urlInspection.index.inspect | Up to 25 URLs, with a compact summary of each. Stops after 90 seconds and marks the rest as skipped |
 | `get_site_overview` | (composite) | Permission level, sitemap health, and totals for the last N days vs. the N days before. A failing part is reported in its own section |
 | `get_quota_status` | (local) | Inspections left today per property, per-minute usage, cooldowns, reset time |
 
@@ -52,7 +52,7 @@ Google's published limits ([source](https://developers.google.com/webmaster-tool
 1. In a Google Cloud project, enable the **Google Search Console API** (APIs & Services → Library).
 2. Create a **service account** (IAM & Admin → Service Accounts). It needs no Cloud roles.
 3. Open the service account, go to Keys, choose Add key → JSON, and download the file.
-4. In [Search Console](https://search.google.com/search-console), open each property and go to **Settings → Users and permissions → Add user**. Enter the service account's email (`…@….iam.gserviceaccount.com`). Restricted permission is enough for reading; use Full if a URL inspection returns a permission error.
+4. In [Search Console](https://search.google.com/search-console), open each property and go to **Settings → Users and permissions → Add user**. Enter the service account's email (`…@….iam.gserviceaccount.com`) and choose **Restricted**. That is enough for every tool, including URL inspection.
 
 ### 2. Configure
 
@@ -67,6 +67,9 @@ sudo chown 1000:1000 secrets/gsc-sa.json && chmod 400 secrets/gsc-sa.json   # th
 Optional settings are documented in [`.env.example`](.env.example):
 - `GSC_ALLOWED_SITES` limits the bot to the properties you list.
 - `ALLOWED_HOSTS` turns on Host header checks.
+- `MCP_PATH` moves the MCP endpoint from `/mcp` to another path, e.g. `/gsc-mcp`.
+
+Never commit the key or `.env`: both are in `.gitignore`.
 
 ### 3. Run on the VPS
 
@@ -86,11 +89,35 @@ gsc-mcp.example.com {
 }
 ```
 
-With nginx, set `proxy_buffering off;`, `proxy_read_timeout 300s;` and `proxy_set_header Host $host;` for the `/mcp` location (the last one matters if you use `ALLOWED_HOSTS`). A 25-URL batch inspection can take a while; it stops itself after 90 seconds (under Cloudflare's 100-second limit for proxied requests) and marks the rest as skipped.
+With nginx, set `proxy_buffering off;`, `proxy_read_timeout 120s;` and `proxy_set_header Host $host;` for the MCP location (the last one matters if you use `ALLOWED_HOSTS`). A 25-URL batch inspection can take a while; it stops itself after 90 seconds (under Cloudflare's 100-second limit for proxied requests) and marks the rest as skipped.
+
+### Alternative: deploy with Dokku
+
+On a server running [Dokku](https://dokku.com), the app builds from the `Dockerfile`. Replace `gsc-mcp.example.com` with your domain:
+
+```bash
+S=/var/lib/dokku/data/storage/gsc-mcp
+dokku apps:create gsc-mcp
+mkdir -p $S/data $S/secrets && chown 1000:1000 $S/data && chown root:1000 $S/secrets && chmod 750 $S/secrets
+# copy the key to $S/secrets/gsc-sa.json, then: chown root:1000 $S/secrets/gsc-sa.json && chmod 640 $S/secrets/gsc-sa.json
+dokku storage:mount gsc-mcp $S/data:/data
+dokku storage:mount gsc-mcp $S/secrets:/run/secrets:ro
+dokku config:set --no-restart gsc-mcp MCP_AUTH_TOKEN="$(openssl rand -hex 32)" \
+  GOOGLE_APPLICATION_CREDENTIALS=/run/secrets/gsc-sa.json ALLOWED_HOSTS=gsc-mcp.example.com MCP_PATH=/mcp
+dokku domains:set gsc-mcp gsc-mcp.example.com
+dokku ports:set gsc-mcp http:80:3000
+dokku nginx:set gsc-mcp proxy-read-timeout 120s
+dokku nginx:set gsc-mcp proxy-buffering off
+dokku resource:limit --memory 256m gsc-mcp
+dokku builder:set gsc-mcp selected dockerfile
+dokku git:sync --build gsc-mcp https://github.com/MichalBrylKaminski/gsc-mcp.git master
+```
+
+To update, push to GitHub and run the last command again. Read the token with `dokku config:get gsc-mcp MCP_AUTH_TOKEN`. If the server isn't public, terminate TLS in front of nginx, for example with Cloudflare.
 
 ### 4. Connect the Grok bot
 
-- MCP endpoint: `https://gsc-mcp.example.com/mcp` (Streamable HTTP, stateless, POST only).
+- MCP endpoint: `https://gsc-mcp.example.com/mcp`, or your `MCP_PATH` (Streamable HTTP, stateless, POST only).
 - Auth header: `Authorization: Bearer <MCP_AUTH_TOKEN>`.
 
 In xAI's API, add it as a remote MCP tool. Check [xAI's Remote MCP docs](https://docs.x.ai/) for the exact field names. With the Python SDK it looks roughly like this:
@@ -122,7 +149,9 @@ Layout:
 ```
 src/
   config.ts           env validation
-  http.ts             express app, bearer auth, /mcp, /healthz
+  http.ts             express app, bearer auth, MCP endpoint (MCP_PATH), /healthz
+  errors.ts           Google error classification and tool error messages
+  cache.ts            LRU + TTL response cache
   server.ts           MCP server and tool registration
   google/client.ts    Search Console client (read-only scope)
   google/service.ts   rate limiting, retries, circuit breaker, cache and allowlist around every call
@@ -138,7 +167,7 @@ src/
 |---|---|
 | `PERMISSION_DENIED` | The service account isn't a user on that property. The message names the email to add. |
 | `NOT_FOUND` | Wrong `siteUrl`. URL-prefix properties need the exact URL with a trailing slash; domain properties are `sc-domain:example.com`. Call `list_sites`. |
-| `AUTH_ERROR` | The key is invalid, deleted or disabled, or the Search Console API isn't enabled in the key's project. |
+| `AUTH_ERROR` | The key is invalid, deleted or disabled, or the Search Console API isn't enabled in the key's Google Cloud project. The message says which. |
 | `LOCAL_RATE_LIMIT` | The server is pacing calls. Retry after `retryAfterSeconds`. |
 | `LOAD_QUOTA_COOLDOWN` | Google reported a Search Analytics quota as exceeded (most likely the load quota). Wait 15 minutes, or use shorter ranges and fewer query/page dimensions. |
 | `GOOGLE_QUOTA_EXCEEDED` | Google reported a quota as used up. URL Inspection pauses for 15 minutes, then 1 hour, then until `resetAt` (midnight Pacific) if it keeps happening. |
