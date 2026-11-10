@@ -444,6 +444,12 @@ describe('GscService quota handling', () => {
     expect(service.limiter.daily.used(DAILY_ID, Date.now())).toBe(0);
   });
 
+  it('explains a disabled Search Console API instead of blaming permissions', async () => {
+    const disabled = googleError(403, 'accessNotConfigured', 'Google Search Console API has not been used in project 123 before or it is disabled.');
+    const service = makeService(fakeApi({ listSites: () => Promise.reject(disabled) }));
+    await expect(service.listSites()).rejects.toMatchObject({ code: 'AUTH_ERROR', message: expect.stringContaining('not enabled') });
+  });
+
   it('turns a 403 into an actionable permission error', async () => {
     const service = makeService(fakeApi({ getSite: async () => Promise.reject(googleError(403, 'forbidden', 'no access')) }));
     await expect(service.getSite('sc-domain:a.com')).rejects.toMatchObject({

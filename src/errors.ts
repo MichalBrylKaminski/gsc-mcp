@@ -42,6 +42,7 @@ export type GoogleErrorKind =
   | 'notFound'
   | 'badRequest'
   | 'auth'
+  | 'apiDisabled' // the Search Console API isn't enabled in the key's Cloud project
   | 'network'
   | 'other';
 
@@ -122,6 +123,9 @@ export function classifyGoogleError(err: unknown): ClassifiedGoogleError {
     return { ...base, kind: 'rateLimit' };
   }
   if (status >= 500) return { ...base, kind: 'server' };
+  if (status === 403 && (reason === 'accessNotConfigured' || reason === 'SERVICE_DISABLED' || /has not been used in project|API .*is disabled/i.test(message))) {
+    return { ...base, kind: 'apiDisabled' };
+  }
   if (status === 401) return { ...base, kind: 'auth' };
   if (status === 403) return { ...base, kind: 'permission' };
   if (status === 404) return { ...base, kind: 'notFound' };
@@ -192,6 +196,12 @@ export function toToolError(err: unknown, ctx: ErrorContext = {}): GscToolError 
       );
     case 'badRequest':
       return new GscToolError('INVALID_ARGUMENT', `Google rejected the request: ${c.message}`);
+    case 'apiDisabled':
+      return new GscToolError(
+        'AUTH_ERROR',
+        "The Google Search Console API is not enabled in the service account's Google Cloud project. Enable it in the Cloud console " +
+          `(APIs & Services > Library > Google Search Console API) and retry in a few minutes. Google said: ${c.message}`,
+      );
     case 'auth':
       return new GscToolError(
         'AUTH_ERROR',
