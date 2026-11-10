@@ -9,6 +9,8 @@ import type { ToolDeps } from './tools/common.js';
 export interface HttpOptions {
   authToken: string;
   allowedHosts?: string[];
+  /** Where the MCP endpoint is served, e.g. "/mcp" (default) or "/gsc-mcp". */
+  mcpPath?: string;
   deps: ToolDeps;
   logger: Logger;
 }
@@ -30,7 +32,7 @@ const methodNotAllowed = (_req: Request, res: Response) => {
   res.status(405).set('Allow', 'POST').json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed. This server is stateless; use POST.' }, id: null });
 };
 
-export function createApp({ authToken, allowedHosts, deps, logger }: HttpOptions): Express {
+export function createApp({ authToken, allowedHosts, mcpPath = '/mcp', deps, logger }: HttpOptions): Express {
   const app = express();
   app.disable('x-powered-by');
 
@@ -62,7 +64,7 @@ export function createApp({ authToken, allowedHosts, deps, logger }: HttpOptions
   mcp.get('/', methodNotAllowed);
   mcp.delete('/', methodNotAllowed);
 
-  app.use('/mcp', mcp);
+  app.use(mcpPath, mcp);
   app.use((_req, res) => {
     res.status(404).json({ error: 'Not found' });
   });

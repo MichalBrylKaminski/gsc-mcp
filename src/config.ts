@@ -39,6 +39,12 @@ const ConfigSchema = z.object({
   GOOGLE_APPLICATION_CREDENTIALS: z.string().min(1),
   HOST: z.string().default('0.0.0.0'),
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
+  // Path of the MCP endpoint, e.g. /gsc-mcp when a reverse proxy publishes it under that path.
+  MCP_PATH: z
+    .string()
+    .regex(/^(\/[A-Za-z0-9._~-]+)+$/, 'MCP_PATH must look like /mcp or /gsc-mcp (no trailing slash)')
+    .refine((p) => p !== '/healthz', 'MCP_PATH cannot be /healthz')
+    .default('/mcp'),
   ALLOWED_HOSTS: csv.transform((hosts, ctx) =>
     hosts?.map((h) => {
       const name = hostnameOnly(h);

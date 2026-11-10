@@ -29,6 +29,7 @@ async function main() {
   const app = createApp({
     authToken: config.MCP_AUTH_TOKEN,
     allowedHosts: config.ALLOWED_HOSTS,
+    mcpPath: config.MCP_PATH,
     deps: { service, logger, maxRowsPerCall: config.GSC_MAX_ROWS_PER_CALL },
     logger,
   });

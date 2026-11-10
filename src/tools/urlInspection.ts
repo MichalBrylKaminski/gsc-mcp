@@ -8,8 +8,8 @@ import { bypassCacheSchema, handle, READ_ONLY, siteUrlSchema, type ToolDeps } fr
 export const MAX_BATCH_URLS = 25;
 /** Stop a batch after this many Google outage errors in a row. */
 export const MAX_CONSECUTIVE_UPSTREAM_ERRORS = 3;
-/** Stop a batch before reverse proxies and Node's request timeout give up on it. */
-export const BATCH_DEADLINE_MS = 240_000;
+/** Stop a batch before reverse proxies give up on it (Cloudflare drops proxied requests after 100 s). */
+export const BATCH_DEADLINE_MS = 90_000;
 
 /** Errors that mean the rest of a batch would fail too. */
 const STOP_CODES = new Set(['CANCELLED', 'DAILY_QUOTA_EXHAUSTED', 'LOCAL_RATE_LIMIT', 'GOOGLE_RATE_LIMIT', 'GOOGLE_QUOTA_EXCEEDED', 'PERMISSION_DENIED', 'AUTH_ERROR', 'SITE_NOT_ALLOWED']);

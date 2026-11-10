@@ -3,6 +3,19 @@ import { hostnameOnly, loadConfig } from '../src/config.js';
 
 const base = { MCP_AUTH_TOKEN: 'x'.repeat(32), GOOGLE_APPLICATION_CREDENTIALS: 'key.json' };
 
+describe('MCP_PATH', () => {
+  it('defaults to /mcp and accepts a custom path', () => {
+    expect(loadConfig(base).MCP_PATH).toBe('/mcp');
+    expect(loadConfig({ ...base, MCP_PATH: '/gsc-mcp' }).MCP_PATH).toBe('/gsc-mcp');
+  });
+
+  it('rejects malformed paths', () => {
+    for (const bad of ['gsc-mcp', '/gsc-mcp/', '/', '/healthz', 'https://x/y']) {
+      expect(() => loadConfig({ ...base, MCP_PATH: bad }), bad).toThrow(/MCP_PATH/);
+    }
+  });
+});
+
 describe('ALLOWED_HOSTS', () => {
   it('normalizes entries the way the SDK parses Host headers', () => {
     expect(hostnameOnly('LOCALHOST:443')).toBe('localhost');

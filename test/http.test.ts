@@ -87,6 +87,21 @@ describe('HTTP edge cases', () => {
     expect(await big.json()).toMatchObject({ error: { code: -32600 } });
   });
 
+  it('serves the MCP endpoint at a custom path', async () => {
+    const app = createApp({ authToken: TOKEN, mcpPath: '/gsc-mcp', deps: { service: makeService(fakeApi()), logger: silentLogger, maxRowsPerCall: 25_000 }, logger: silentLogger });
+    const s = app.listen(0, '127.0.0.1');
+    await new Promise((r) => s.once('listening', r));
+    const url = `http://127.0.0.1:${(s.address() as AddressInfo).port}`;
+    const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+    try {
+      expect((await fetch(`${url}/gsc-mcp`, { method: 'POST', headers: auth, body })).status).toBe(200);
+      expect((await fetch(`${url}/mcp`, { method: 'POST', headers: auth, body })).status).toBe(404);
+      expect((await fetch(`${url}/healthz`)).status).toBe(200);
+    } finally {
+      await new Promise((r) => s.close(r));
+    }
+  });
+
   it('rejects unknown Host headers when ALLOWED_HOSTS is set', async () => {
     const app = createApp({
       authToken: TOKEN,

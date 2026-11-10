@@ -86,7 +86,7 @@ gsc-mcp.example.com {
 }
 ```
 
-With nginx, set `proxy_buffering off;`, `proxy_read_timeout 300s;` and `proxy_set_header Host $host;` for the `/mcp` location (the last one matters if you use `ALLOWED_HOSTS`). A 25-URL batch inspection can take a while; it stops itself after 4 minutes.
+With nginx, set `proxy_buffering off;`, `proxy_read_timeout 300s;` and `proxy_set_header Host $host;` for the `/mcp` location (the last one matters if you use `ALLOWED_HOSTS`). A 25-URL batch inspection can take a while; it stops itself after 90 seconds (under Cloudflare's 100-second limit for proxied requests) and marks the rest as skipped.
 
 ### 4. Connect the Grok bot
 
