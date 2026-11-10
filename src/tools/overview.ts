@@ -1,5 +1,6 @@
 import type { McpServer } from '@modelcontextprotocol/sdk/server/mcp.js';
 import { z } from 'zod';
+import { GscToolError } from '../errors.js';
 import type { ApiDataRow } from '../google/client.js';
 import type { GscService } from '../google/service.js';
 import { addDays, ptDay } from '../time.js';
@@ -88,31 +89,54 @@ export function comparePeriods(rows: ApiDataRow[], days: number, opts: { today: 
   };
 }
 
-export async function runSiteOverview(service: GscService, args: { siteUrl: string; days?: number; type?: string; bypassCache?: boolean }) {
+/** A section that failed: the bot still gets the other sections. */
+function sectionError(reason: unknown) {
+  const e = reason instanceof GscToolError ? reason : new GscToolError('INTERNAL', 'Internal server error.');
+  return { error: { code: e.code, message: e.message, ...e.details } };
+}
+
+export async function runSiteOverview(
+  service: GscService,
+  args: { siteUrl: string; days?: number; type?: string; bypassCache?: boolean },
+  signal?: AbortSignal,
+) {
+  const siteUrl = service.site(args.siteUrl); // bad input fails the whole call
   const days = args.days ?? 28;
   const today = ptDay(Date.now());
   const startDate = addDays(today, -(2 * days + LAG_PADDING_DAYS));
-  const [site, sitemaps, analytics] = await Promise.all([
-    service.getSite(args.siteUrl, args.bypassCache),
-    service.listSitemaps(args.siteUrl, undefined, args.bypassCache),
+  const results = await Promise.allSettled([
+    service.getSite(siteUrl, args.bypassCache, { signal }),
+    service.listSitemaps(siteUrl, undefined, args.bypassCache, { signal }),
     service.querySearchAnalytics(
-      args.siteUrl,
+      siteUrl,
       { startDate, endDate: today, dimensions: ['date'], type: args.type, dataState: 'final', rowLimit: 1_000 },
       args.bypassCache,
+      { signal },
     ),
   ]);
-  const maps = sitemaps.value.map(formatSitemap);
+  const [site, sitemaps, analytics] = results;
+  // Nothing worked (e.g. no permission, or the client left): report it as an error.
+  if (site.status === 'rejected' && sitemaps.status === 'rejected' && analytics.status === 'rejected') throw site.reason;
+  const maps = sitemaps.status === 'fulfilled' ? sitemaps.value.value.map(formatSitemap) : undefined;
   return {
-    site: { siteUrl: site.value.siteUrl, permissionLevel: site.value.permissionLevel },
-    performance: { type: args.type ?? 'web', days, ...comparePeriods(analytics.value.rows ?? [], days, { today, fetchedFrom: startDate }) },
-    sitemaps: {
-      count: maps.length,
-      withErrors: maps.filter((m) => (m.errors ?? 0) > 0).length,
-      withWarnings: maps.filter((m) => (m.warnings ?? 0) > 0).length,
-      pending: maps.filter((m) => m.isPending).length,
-      items: maps,
-    },
-    cached: site.cached && sitemaps.cached && analytics.cached,
+    site:
+      site.status === 'fulfilled'
+        ? { siteUrl: site.value.value.siteUrl, permissionLevel: site.value.value.permissionLevel }
+        : { siteUrl, ...sectionError(site.reason) },
+    performance:
+      analytics.status === 'fulfilled'
+        ? { type: args.type ?? 'web', days, ...comparePeriods(analytics.value.value.rows ?? [], days, { today, fetchedFrom: startDate }) }
+        : { type: args.type ?? 'web', days, ...sectionError(analytics.reason) },
+    sitemaps: maps
+      ? {
+          count: maps.length,
+          withErrors: maps.filter((m) => (m.errors ?? 0) > 0).length,
+          withWarnings: maps.filter((m) => (m.warnings ?? 0) > 0).length,
+          pending: maps.filter((m) => m.isPending).length,
+          items: maps,
+        }
+      : sectionError(sitemaps.status === 'rejected' ? sitemaps.reason : undefined),
+    cached: results.every((r) => r.status === 'fulfilled' && r.value.cached),
   };
 }
 
@@ -125,7 +149,8 @@ export function registerOverviewTools(server: McpServer, { service, logger }: To
         "One-call summary of a property: the service account's permission level, sitemap health, and total clicks, impressions, CTR and " +
         'average position for the last N days of final data compared with the N days before. Uses one cheap date-grouped analytics query. ' +
         'The current period ends on the latest day with final data (normally 2-3 days ago); "noRecentData" flags a site whose data stops ' +
-        'earlier, which may mean it lost its search traffic. "daysWithData" counts days that had impressions.',
+        'earlier, which may mean it lost its search traffic. "daysWithData" counts days that had impressions. ' +
+        'If one part fails (e.g. a Search Analytics cooldown), that section holds an "error" and the others are still returned.',
       inputSchema: {
         siteUrl: siteUrlSchema,
         days: z.number().int().min(1).max(MAX_OVERVIEW_DAYS).optional().describe('Length of each period in days (default 28).'),
@@ -134,6 +159,6 @@ export function registerOverviewTools(server: McpServer, { service, logger }: To
       },
       annotations: READ_ONLY,
     },
-    handle(logger, (args: { siteUrl: string; days?: number; type?: string; bypassCache?: boolean }) => runSiteOverview(service, args)),
+    handle(logger, (args: { siteUrl: string; days?: number; type?: string; bypassCache?: boolean }, { signal }) => runSiteOverview(service, args, signal)),
   );
 }

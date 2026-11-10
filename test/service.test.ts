@@ -1,4 +1,4 @@
-import { describe, expect, it, vi } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { normalizeSiteUrl, urlInProperty } from '../src/google/service.js';
 import { fakeApi, googleError, makeService } from './helpers.js';
 
@@ -174,6 +174,107 @@ describe('GscService quota handling', () => {
     await expect(service.inspectUrl('sc-domain:a.com', 'https://a.com/x#top')).resolves.toMatchObject({ cached: true });
     expect(inspectUrl).toHaveBeenCalledTimes(1);
     expect((inspectUrl.mock.calls[0] as unknown[])[0]).toMatchObject({ inspectionUrl: 'https://a.com/x' });
+  });
+
+  describe('repeated quota errors', () => {
+    afterEach(() => vi.useRealTimers());
+
+    it('pauses URL Inspection on a generic quota error, stepping up to PT midnight while errors continue', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-11-08T12:00:00Z'));
+      const inspectUrl = vi.fn().mockRejectedValue(googleError(429, 'rateLimitExceeded', 'Quota exceeded'));
+      const service = makeService(fakeApi({ inspectUrl }));
+      const first = await service.inspectUrl('sc-domain:a.com', 'https://a.com/1').catch((e) => e);
+      expect(first).toMatchObject({ code: 'GOOGLE_QUOTA_EXCEEDED', details: { retryAfterSeconds: 900 } });
+      expect(first.details.resetAt).toBeUndefined();
+      expect(inspectUrl).toHaveBeenCalledTimes(1); // not retried: each try costs a daily inspection
+      await expect(service.inspectUrl('sc-domain:a.com', 'https://a.com/2')).rejects.toMatchObject({ code: 'GOOGLE_QUOTA_EXCEEDED' });
+      expect(inspectUrl).toHaveBeenCalledTimes(1);
+
+      vi.setSystemTime(new Date('2026-11-08T12:16:00Z'));
+      expect(await service.inspectUrl('sc-domain:a.com', 'https://a.com/3').catch((e) => e)).toMatchObject({ details: { retryAfterSeconds: 3600 } });
+      vi.setSystemTime(new Date('2026-11-08T13:17:00Z'));
+      const third = await service.inspectUrl('sc-domain:a.com', 'https://a.com/4').catch((e) => e);
+      expect(third).toMatchObject({ code: 'GOOGLE_QUOTA_EXCEEDED', details: { resetAt: '2026-11-09T08:00:00.000Z' } });
+      expect(service.quotaStatus(['sc-domain:a.com']).sites[0]?.urlInspectionCooldownSeconds).toBe(19 * 3600 - 17 * 60);
+    });
+
+    it('starts again at 15 minutes after a successful call or a new PT day', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-11-08T12:00:00Z'));
+      let fail = true;
+      const query = vi.fn(async () => {
+        if (fail) throw googleError(429, 'rateLimitExceeded', 'Quota exceeded');
+        return { rows: [] };
+      });
+      const service = makeService(fakeApi({ querySearchAnalytics: query }));
+      const run = (endDate: string) => service.querySearchAnalytics('sc-domain:a.com', { ...body, endDate }).catch((e) => e);
+      expect(await run('2026-10-01')).toMatchObject({ details: { retryAfterSeconds: 900 } });
+      // The reviewer's case: queries succeed after the pause, then one heavy query trips the short-term quota again.
+      vi.setSystemTime(new Date('2026-11-08T12:16:00Z'));
+      fail = false;
+      await run('2026-10-02');
+      fail = true;
+      vi.setSystemTime(new Date('2026-11-08T12:45:00Z'));
+      expect(await run('2026-10-03')).toMatchObject({ code: 'LOAD_QUOTA_COOLDOWN', details: { retryAfterSeconds: 900 } });
+      // Errors right after the pause step up...
+      vi.setSystemTime(new Date('2026-11-08T13:01:00Z'));
+      expect(await run('2026-10-04')).toMatchObject({ details: { retryAfterSeconds: 3600 } });
+      vi.setSystemTime(new Date('2026-11-09T07:30:00Z')); // 23:30 PT
+      expect(await run('2026-10-05')).toMatchObject({ code: 'GOOGLE_QUOTA_EXCEEDED', details: { resetAt: '2026-11-09T08:00:00.000Z' } });
+      // ...but a new PT day starts over.
+      vi.setSystemTime(new Date('2026-11-09T08:20:00Z'));
+      expect(await run('2026-10-06')).toMatchObject({ code: 'LOAD_QUOTA_COOLDOWN', details: { retryAfterSeconds: 900 } });
+    });
+
+    it('does not step up for requests already in flight when the pause began', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-11-08T12:00:00Z'));
+      let release!: () => void;
+      const gate = new Promise<void>((r) => (release = r));
+      const query = vi.fn(async () => {
+        await gate;
+        throw googleError(429, 'rateLimitExceeded', 'Quota exceeded');
+      });
+      const service = makeService(fakeApi({ querySearchAnalytics: query }), { maxConcurrency: 2 });
+      const both = Promise.allSettled([
+        service.querySearchAnalytics('sc-domain:a.com', body),
+        service.querySearchAnalytics('sc-domain:a.com', { ...body, endDate: '2026-10-30' }),
+      ]);
+      await vi.waitFor(() => expect(query).toHaveBeenCalledTimes(2));
+      release();
+      await both;
+      expect(service.quotaStatus(['sc-domain:a.com']).sites[0]?.searchAnalyticsCooldownSeconds).toBe(900);
+    });
+
+    it('pauses Search Analytics for every property briefly when three properties hit quota together', async () => {
+      const failing = new Set(['sc-domain:a.com', 'sc-domain:b.com', 'sc-domain:c.com']);
+      const query = vi.fn(async (site: string) => {
+        if (!failing.has(site)) return { rows: [] };
+        throw googleError(429, 'rateLimitExceeded', 'Quota exceeded');
+      });
+      const service = makeService(fakeApi({ querySearchAnalytics: query }));
+      await service.querySearchAnalytics('sc-domain:a.com', body).catch(() => {});
+      await service.querySearchAnalytics('sc-domain:b.com', body).catch(() => {});
+      await expect(service.querySearchAnalytics('sc-domain:d.com', body)).resolves.toBeDefined(); // two aren't enough
+      await service.querySearchAnalytics('sc-domain:c.com', body).catch(() => {});
+      const blocked = await service.querySearchAnalytics('sc-domain:d.com', { ...body, endDate: '2026-10-30' }).catch((e) => e);
+      expect(blocked).toMatchObject({ code: 'LOAD_QUOTA_COOLDOWN', message: expect.stringContaining('every property') });
+      expect(blocked.details.retryAfterSeconds).toBeLessThanOrEqual(300);
+      expect(query).toHaveBeenCalledTimes(4);
+    });
+  });
+
+  it('cancels sites, sitemaps and analytics calls when the client disconnects', async () => {
+    const controller = new AbortController();
+    controller.abort();
+    const service = makeService(fakeApi());
+    const opts = { signal: controller.signal };
+    await expect(service.listSites(false, opts)).rejects.toMatchObject({ code: 'CANCELLED' });
+    await expect(service.getSite('sc-domain:a.com', false, opts)).rejects.toMatchObject({ code: 'CANCELLED' });
+    await expect(service.listSitemaps('sc-domain:a.com', undefined, false, opts)).rejects.toMatchObject({ code: 'CANCELLED' });
+    await expect(service.getSitemap('sc-domain:a.com', 'https://a.com/s.xml', false, opts)).rejects.toMatchObject({ code: 'CANCELLED' });
+    await expect(service.querySearchAnalytics('sc-domain:a.com', body, false, opts)).rejects.toMatchObject({ code: 'CANCELLED' });
   });
 
   it('still retries short rate limits on other APIs', async () => {

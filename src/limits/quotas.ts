@@ -31,6 +31,19 @@ export const GOOGLE_LIMITS = {
 /** Google's advice: after a short-term load-quota error, wait 15 minutes. */
 export const LOAD_QUOTA_COOLDOWN_MS = 15 * 60_000;
 
+/**
+ * Google: "If you still exceed quota, you are exceeding long-term quota." Pauses
+ * after quota errors with no successful call in between step up: 15 min, 1 h,
+ * then until PT midnight. A success or a new PT day starts again at 15 min.
+ */
+export const QUOTA_PAUSE_STEPS_MS = [LOAD_QUOTA_COOLDOWN_MS, 60 * 60_000] as const;
+
+/** First-step pauses on this many properties within the window suggest an account-wide load quota... */
+export const GLOBAL_PAUSE_MIN_PROPERTIES = 3;
+export const GLOBAL_PAUSE_TRIGGER_WINDOW_MS = 10 * 60_000;
+/** ...so Search Analytics pauses for every property this long. */
+export const GLOBAL_PAUSE_MS = 5 * 60_000;
+
 export type Bucket = 'searchAnalytics' | 'urlInspection' | 'other';
 
 export interface WindowSpec {

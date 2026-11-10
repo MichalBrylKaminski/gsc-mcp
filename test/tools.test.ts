@@ -1,7 +1,7 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import type { SearchAnalyticsQueryRequest } from '../src/google/client.js';
 import { comparePeriods, LAG_PADDING_DAYS, runSiteOverview } from '../src/tools/overview.js';
-import { MAX_PAGE_SIZE, runSearchAnalytics, validateQuery, type SearchAnalyticsInput } from '../src/tools/searchAnalytics.js';
+import { DEFAULT_FETCH_ALL_ROWS, MAX_PAGE_SIZE, runSearchAnalytics, validateQuery, type SearchAnalyticsInput } from '../src/tools/searchAnalytics.js';
 import { runBatchInspection } from '../src/tools/urlInspection.js';
 import { fakeApi, googleError, makeService } from './helpers.js';
 
@@ -58,9 +58,30 @@ describe('runSearchAnalytics', () => {
   it('fetchAll stops at the row cap', async () => {
     const query = pagedApi(60_000);
     const service = makeService(fakeApi({ querySearchAnalytics: query }));
-    const res = await runSearchAnalytics(service, { ...base, fetchAll: true, dimensions: ['query'] }, 30_000);
+    const res = await runSearchAnalytics(service, { ...base, fetchAll: true, dimensions: ['query'], maxRows: 100_000 }, 30_000);
     expect(query.mock.calls.map((c) => c[1].rowLimit)).toEqual([25_000, 5_000]);
     expect(res).toMatchObject({ rowCount: 30_000, truncated: true, nextStartRow: 30_000 });
+  });
+
+  it('fetchAll returns a context-friendly number of rows unless asked for more', async () => {
+    const query = pagedApi(60_000);
+    const service = makeService(fakeApi({ querySearchAnalytics: query }));
+    const res = await runSearchAnalytics(service, { ...base, fetchAll: true, dimensions: ['query'] }, 25_000);
+    expect(res).toMatchObject({ rowCount: DEFAULT_FETCH_ALL_ROWS, truncated: true, requests: 1 });
+  });
+
+  it('stops paging when the client disconnects', async () => {
+    const controller = new AbortController();
+    const inner = pagedApi(100_000);
+    const query = vi.fn(async (site: string, body: SearchAnalyticsQueryRequest) => {
+      const res = await inner(site, body);
+      controller.abort();
+      return res;
+    });
+    const service = makeService(fakeApi({ querySearchAnalytics: query }));
+    const err = await runSearchAnalytics(service, { ...base, fetchAll: true, maxRows: 75_000 }, 75_000, controller.signal).catch((e) => e);
+    expect(err).toMatchObject({ code: 'CANCELLED' });
+    expect(query).toHaveBeenCalledTimes(1);
   });
 
   it('rejects invalid queries without calling Google', async () => {
@@ -124,6 +145,21 @@ describe('runSiteOverview', () => {
     expect(LAG_PADDING_DAYS).toBe(14);
     expect(query.mock.calls[0]![1]).toMatchObject({ startDate: '2026-08-30', endDate: '2026-11-08', dimensions: ['date'], dataState: 'final' });
     expect(res.performance).toMatchObject({ days: 28, latestDataDate: null, noRecentData: true, current: { endDate: '2026-11-04' } });
+  });
+
+  it('still returns the site and sitemaps when analytics is paused', async () => {
+    const query = vi.fn().mockRejectedValue(googleError(429, 'rateLimitExceeded', 'Quota exceeded'));
+    const service = makeService(fakeApi({ querySearchAnalytics: query, listSitemaps: async () => [{ path: 'https://a.com/sitemap.xml', errors: '2' }] }));
+    const res = await runSiteOverview(service, { siteUrl: 'sc-domain:a.com' });
+    expect(res.site).toMatchObject({ siteUrl: 'sc-domain:a.com', permissionLevel: 'siteFullUser' });
+    expect(res.sitemaps).toMatchObject({ count: 1, withErrors: 1 });
+    expect(res.performance).toMatchObject({ days: 28, error: { code: 'LOAD_QUOTA_COOLDOWN' } });
+  });
+
+  it('fails as a whole only when every part fails', async () => {
+    const denied = () => Promise.reject(googleError(403, 'forbidden', 'no access'));
+    const service = makeService(fakeApi({ getSite: denied, listSitemaps: denied, querySearchAnalytics: denied }));
+    await expect(runSiteOverview(service, { siteUrl: 'sc-domain:a.com' })).rejects.toMatchObject({ code: 'PERMISSION_DENIED' });
   });
 });
 

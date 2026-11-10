@@ -7,6 +7,8 @@ import { bypassCacheSchema, handle, READ_ONLY, siteUrlSchema, type ToolDeps } fr
 
 /** Google's maximum rows per Search Analytics request. */
 export const MAX_PAGE_SIZE = 25_000;
+/** fetchAll's default row target: 25,000 query+page rows would be several MB, too much for an LLM's context. */
+export const DEFAULT_FETCH_ALL_ROWS = 5_000;
 
 const DIMENSIONS = ['date', 'hour', 'query', 'page', 'country', 'device', 'searchAppearance'] as const;
 const FILTER_DIMENSIONS = ['country', 'device', 'page', 'query', 'searchAppearance'] as const;
@@ -61,7 +63,12 @@ export const searchAnalyticsInput = {
     .boolean()
     .optional()
     .describe('Page through results automatically (25,000 rows per request) until no rows are left or maxRows is reached.'),
-  maxRows: z.number().int().min(1).optional().describe('With fetchAll: stop after this many rows. Capped by the server limit.'),
+  maxRows: z
+    .number()
+    .int()
+    .min(1)
+    .optional()
+    .describe(`With fetchAll: stop after this many rows (default ${DEFAULT_FETCH_ALL_ROWS.toLocaleString('en-US')}, capped by the server limit). Large results can overflow your context.`),
   bypassCache: bypassCacheSchema,
 };
 
@@ -94,7 +101,7 @@ export function validateQuery(q: SearchAnalyticsInput): string[] {
 const round = (n: number | null | undefined, digits: number) => (n == null ? null : Number(n.toFixed(digits)));
 
 /** Fetches one or more pages and returns compact, column-oriented rows. */
-export async function runSearchAnalytics(service: GscService, q: SearchAnalyticsInput, maxRowsPerCall: number) {
+export async function runSearchAnalytics(service: GscService, q: SearchAnalyticsInput, maxRowsPerCall: number, signal?: AbortSignal) {
   const problems = validateQuery(q);
   if (problems.length) throw new GscToolError('INVALID_ARGUMENT', problems.join(' '));
 
@@ -113,7 +120,7 @@ export async function runSearchAnalytics(service: GscService, q: SearchAnalytics
     dataState: q.dataState,
   };
 
-  const target = q.fetchAll ? Math.min(q.maxRows ?? maxRowsPerCall, maxRowsPerCall) : Math.min(q.rowLimit ?? 1_000, maxRowsPerCall);
+  const target = q.fetchAll ? Math.min(q.maxRows ?? DEFAULT_FETCH_ALL_ROWS, maxRowsPerCall) : Math.min(q.rowLimit ?? 1_000, maxRowsPerCall);
   const pageSize = q.fetchAll ? MAX_PAGE_SIZE : target;
   const rows: unknown[][] = [];
   let startRow = q.startRow ?? 0;
@@ -124,7 +131,8 @@ export async function runSearchAnalytics(service: GscService, q: SearchAnalytics
 
   while (rows.length < target) {
     const want = Math.min(pageSize, target - rows.length);
-    const { value, cached } = await service.querySearchAnalytics(siteUrl, { ...body, rowLimit: want, startRow }, q.bypassCache);
+    // The service stops at once if the client disconnected, including between pages.
+    const { value, cached } = await service.querySearchAnalytics(siteUrl, { ...body, rowLimit: want, startRow }, q.bypassCache, { signal });
     pages++;
     allCached &&= cached;
     last = value;
@@ -172,6 +180,6 @@ export function registerSearchAnalyticsTools(server: McpServer, { service, logge
       inputSchema: searchAnalyticsInput,
       annotations: READ_ONLY,
     },
-    handle(logger, (args: SearchAnalyticsInput) => runSearchAnalytics(service, args, maxRowsPerCall)),
+    handle(logger, (args: SearchAnalyticsInput, { signal }) => runSearchAnalytics(service, args, maxRowsPerCall, signal)),
   );
 }

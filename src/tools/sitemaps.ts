@@ -34,8 +34,8 @@ export function registerSitemapTools(server: McpServer, { service, logger }: Too
       },
       annotations: READ_ONLY,
     },
-    handle(logger, async ({ siteUrl, sitemapIndex, bypassCache }: { siteUrl: string; sitemapIndex?: string; bypassCache?: boolean }) => {
-      const { value, cached } = await service.listSitemaps(siteUrl, sitemapIndex, bypassCache);
+    handle(logger, async ({ siteUrl, sitemapIndex, bypassCache }: { siteUrl: string; sitemapIndex?: string; bypassCache?: boolean }, { signal }) => {
+      const { value, cached } = await service.listSitemaps(siteUrl, sitemapIndex, bypassCache, { signal });
       return { sitemaps: value.map(formatSitemap), count: value.length, cached };
     }),
   );
@@ -52,8 +52,8 @@ export function registerSitemapTools(server: McpServer, { service, logger }: Too
       },
       annotations: READ_ONLY,
     },
-    handle(logger, async ({ siteUrl, feedpath, bypassCache }: { siteUrl: string; feedpath: string; bypassCache?: boolean }) => {
-      const { value, cached } = await service.getSitemap(siteUrl, feedpath, bypassCache);
+    handle(logger, async ({ siteUrl, feedpath, bypassCache }: { siteUrl: string; feedpath: string; bypassCache?: boolean }, { signal }) => {
+      const { value, cached } = await service.getSitemap(siteUrl, feedpath, bypassCache, { signal });
       return { sitemap: formatSitemap(value), cached };
     }),
   );

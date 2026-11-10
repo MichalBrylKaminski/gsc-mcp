@@ -1,10 +1,18 @@
 import { cacheKey, ResponseCache, TTL } from '../cache.js';
-import { cancelledError, classifyGoogleError, deadlineError, GscToolError, loadQuotaError, toToolError, type ClassifiedGoogleError } from '../errors.js';
+import { cancelledError, classifyGoogleError, deadlineError, GscToolError, toToolError, type ClassifiedGoogleError } from '../errors.js';
 import { DailyCounters, RateLimiter, Semaphore, SlidingWindows } from '../limits/limiter.js';
-import { limitsFor, LOAD_QUOTA_COOLDOWN_MS, type Bucket } from '../limits/quotas.js';
+import {
+  GLOBAL_PAUSE_MIN_PROPERTIES,
+  GLOBAL_PAUSE_MS,
+  GLOBAL_PAUSE_TRIGGER_WINDOW_MS,
+  GOOGLE_LIMITS,
+  limitsFor,
+  QUOTA_PAUSE_STEPS_MS,
+  type Bucket,
+} from '../limits/quotas.js';
 import { CircuitBreaker, withRetry } from '../limits/retry.js';
 import type { Logger } from '../logger.js';
-import { nextPtMidnight } from '../time.js';
+import { nextPtMidnight, ptDay } from '../time.js';
 import type { GscApi, InspectUrlIndexRequest, RequestOptions, SearchAnalyticsQueryRequest } from './client.js';
 
 export interface GscServiceOptions {
@@ -101,6 +109,7 @@ export interface CallOptions {
 }
 
 const MAX_JOIN_ATTEMPTS = 3;
+const GLOBAL_ANALYTICS_KEY = 'searchAnalytics:*';
 
 export class GscService {
   readonly limiter: RateLimiter;
@@ -108,6 +117,9 @@ export class GscService {
   private readonly cache: ResponseCache;
   private readonly semaphore: Semaphore;
   private readonly allowed?: Set<string>;
+  /** Consecutive quota pauses per property (no success in between), to spot a used-up daily quota. */
+  private readonly quotaStrikes = new Map<string, { step: number; day: string }>();
+  private recentAnalyticsPauses: { site: string; at: number }[] = [];
 
   constructor(
     private readonly api: GscApi,
@@ -172,7 +184,11 @@ export class GscService {
               // Another call may have paused this site while we queued.
               this.checkBreaker(spec);
               try {
-                return await spec.run({ signal: requestSignal(signal, deadline) });
+                const value = await spec.run({ signal: requestSignal(signal, deadline) });
+                // Google is serving this property again, so the next quota error starts at the shortest pause.
+                const key = this.breakerKey(spec);
+                if (key) this.quotaStrikes.delete(key);
+                return value;
               } catch (err) {
                 // Record quota state before the slot is released, so queued calls see it.
                 if (!signal?.aborted) this.noteQuotaError(spec, classifyGoogleError(err));
@@ -185,8 +201,8 @@ export class GscService {
         },
         {
           ...this.opts.retry,
-          // Any Search Analytics quota error is treated as load quota (see loadQuotaError), and retrying adds load.
-          retryable: spec.bucket === 'searchAnalytics' ? (c) => c.kind !== 'rateLimit' : undefined,
+          // Quota errors pause the property instead (see noteQuotaError): a retry only adds load or spends inspections.
+          retryable: spec.bucket === 'other' ? undefined : (c) => c.kind !== 'rateLimit',
           deadline,
           signal,
           onRetry: ({ attempt, delayMs, error }) =>
@@ -198,70 +214,132 @@ export class GscService {
       if (signal?.aborted) throw cancelledError();
       const c = classifyGoogleError(err);
       if (deadline !== undefined && Date.now() >= deadline && c.status === undefined) throw deadlineError();
-      if (this.breakerKey(spec) && (c.kind === 'loadQuota' || c.kind === 'rateLimit')) throw loadQuotaError(spec.siteUrl, c.message);
+      if (c.kind === 'loadQuota' || c.kind === 'rateLimit') {
+        const open = this.openPause(spec);
+        if (open) throw this.pauseError(spec, open, c.message);
+      }
       throw err;
     }
   }
 
+  /** The per-property pause key for buckets with quota pauses. */
   private breakerKey(spec: { bucket: Bucket; siteUrl?: string }): string | undefined {
-    return spec.bucket === 'searchAnalytics' && spec.siteUrl ? `searchAnalytics:${spec.siteUrl}` : undefined;
+    return spec.bucket !== 'other' && spec.siteUrl ? `${spec.bucket}:${spec.siteUrl}` : undefined;
+  }
+
+  /** The active pause for a call, if any: its property's, or the account-wide Search Analytics one. */
+  private openPause(spec: { bucket: Bucket; siteUrl?: string }, now = Date.now()) {
+    const key = this.breakerKey(spec);
+    const site = key ? this.breaker.check(key, now) : undefined;
+    const global = spec.bucket === 'searchAnalytics' ? this.breaker.check(GLOBAL_ANALYTICS_KEY, now) : undefined;
+    if (site && global) return site.remainingMs >= global.remainingMs ? site : global;
+    return site ?? global;
   }
 
   private checkBreaker(spec: CallSpec<unknown>): void {
-    const key = this.breakerKey(spec);
-    const open = key ? this.breaker.check(key) : undefined;
-    if (!open) return;
+    const open = this.openPause(spec);
+    if (open) throw this.pauseError(spec, open);
+  }
+
+  private pauseError(spec: CallSpec<unknown>, open: { remainingMs: number; reason: string }, googleMessage?: string): GscToolError {
     const retryAfterSeconds = Math.ceil(open.remainingMs / 1000);
+    const minutes = Math.ceil(retryAfterSeconds / 60);
+    const what = spec.bucket === 'searchAnalytics' ? 'Search Analytics' : 'URL Inspection';
+    const said = googleMessage ? ` Google said: ${googleMessage}` : '';
     if (open.reason === 'dailyQuota') {
       const resetAt = new Date(Date.now() + open.remainingMs).toISOString();
-      throw new GscToolError(
+      return new GscToolError(
         'GOOGLE_QUOTA_EXCEEDED',
-        `Search Analytics for "${spec.siteUrl}" is paused until midnight Pacific Time (${resetAt}) because Google reported a daily quota as exceeded.`,
+        `${what} for "${spec.siteUrl}" is paused until midnight Pacific Time (${resetAt}): Google reported a daily limit, or kept reporting ` +
+          `its quota as exceeded after 15-minute and 1-hour pauses with no successful call, so today's quota is most likely used up.${said}`,
         { resetAt, retryAfterSeconds },
       );
     }
-    throw new GscToolError(
+    if (open.reason === 'quotaGlobal') {
+      return new GscToolError(
+        'LOAD_QUOTA_COOLDOWN',
+        `Search Analytics is paused for every property for ${minutes} min because Google reported quota errors on several properties ` +
+          `within minutes (the load quota may apply to the whole account). Repeat earlier (cached) queries meanwhile.${said}`,
+        { retryAfterSeconds },
+      );
+    }
+    if (spec.bucket === 'urlInspection') {
+      return new GscToolError(
+        'GOOGLE_QUOTA_EXCEEDED',
+        `URL Inspection for "${spec.siteUrl}" is paused for ${minutes} min because Google reported a quota as exceeded. This server stays ` +
+          "under the per-minute limit, so this usually means the property's ~2,000 daily inspections are used up (other tools using the " +
+          `property share them). If it keeps happening, the pause grows to 1 hour, then until midnight Pacific.${said}`,
+        { retryAfterSeconds },
+      );
+    }
+    return new GscToolError(
       'LOAD_QUOTA_COOLDOWN',
-      `Search Analytics for "${spec.siteUrl}" is cooling down because Google reported a quota as exceeded (most likely its load quota). ` +
-        `Retry in ${Math.ceil(retryAfterSeconds / 60)} min, or repeat earlier (cached) queries.`,
+      `Search Analytics for "${spec.siteUrl}" is paused for ${minutes} min because Google reported a quota as exceeded (most likely its ` +
+        `load quota). Use shorter date ranges and fewer page/query dimensions, or repeat earlier (cached) queries.${said}`,
       { retryAfterSeconds },
     );
   }
 
-  /** Records what a Google error says about quota, so later calls don't repeat it. */
+  /**
+   * Records what a Google error says about quota, so later calls don't repeat it.
+   * Google sends the same error for every exceeded quota, so a generic one
+   * pauses the property: 15 minutes, then 1 hour, then until midnight Pacific
+   * if errors keep coming with no successful call in between.
+   */
   private noteQuotaError(spec: CallSpec<unknown>, c: ClassifiedGoogleError): void {
     const log = this.opts.logger;
     const key = this.breakerKey(spec);
-    if (key && (c.kind === 'loadQuota' || c.kind === 'rateLimit')) {
-      this.breaker.trip(key, LOAD_QUOTA_COOLDOWN_MS, 'loadQuota');
-      log.warn('search analytics paused', { site: spec.siteUrl, kind: c.kind, cooldownMs: LOAD_QUOTA_COOLDOWN_MS });
+    if (!key) return;
+    const now = Date.now();
+    if (c.kind === 'dailyQuota') {
+      if (spec.bucket === 'urlInspection') {
+        // Google's own daily limit, not the scaled one, so raising QUOTA_SAFETY_FACTOR can't reopen today.
+        const daily = limitsFor('urlInspection', spec.siteUrl, this.opts.safetyFactor).daily[0]!;
+        this.limiter.daily.fill(daily.id, GOOGLE_LIMITS.urlInspection.perSitePerDay, now);
+      } else {
+        this.breaker.trip(key, nextPtMidnight(now) - now, 'dailyQuota', now);
+      }
+      log.warn('google reported a daily quota exhausted', { bucket: spec.bucket, site: spec.siteUrl });
+      return;
     }
-    if (key && c.kind === 'dailyQuota') {
-      const now = Date.now();
-      this.breaker.trip(key, nextPtMidnight(now) - now, 'dailyQuota', now);
-      log.warn('search analytics paused until PT midnight', { site: spec.siteUrl });
-    }
-    if (c.kind === 'dailyQuota' && spec.bucket === 'urlInspection' && spec.siteUrl) {
-      const daily = limitsFor('urlInspection', spec.siteUrl, this.opts.safetyFactor).daily[0]!;
-      this.limiter.daily.fill(daily.id, daily.limit, Date.now());
-      log.warn('google reported daily inspection quota exhausted', { site: spec.siteUrl });
+    if (c.kind !== 'loadQuota' && c.kind !== 'rateLimit') return;
+    // A request sent before a pause (this property's or the account-wide one) began; that pause already covers it.
+    if (this.openPause(spec, now)) return;
+    const today = ptDay(now);
+    const prev = this.quotaStrikes.get(key);
+    const step = prev && prev.day === today ? prev.step + 1 : 0;
+    this.quotaStrikes.set(key, { step, day: today });
+    const untilMidnight = step >= QUOTA_PAUSE_STEPS_MS.length;
+    const ms = untilMidnight ? nextPtMidnight(now) - now : QUOTA_PAUSE_STEPS_MS[step]!;
+    this.breaker.trip(key, ms, untilMidnight ? 'dailyQuota' : 'quota', now);
+    log.warn('paused after google quota error', { bucket: spec.bucket, site: spec.siteUrl, step, pauseMs: ms });
+    // Only first pauses count: a repeat on one property says nothing about the account.
+    if (spec.bucket === 'searchAnalytics' && spec.siteUrl && step === 0) {
+      this.recentAnalyticsPauses = this.recentAnalyticsPauses.filter((p) => now - p.at < GLOBAL_PAUSE_TRIGGER_WINDOW_MS);
+      this.recentAnalyticsPauses.push({ site: spec.siteUrl, at: now });
+      if (new Set(this.recentAnalyticsPauses.map((p) => p.site)).size >= GLOBAL_PAUSE_MIN_PROPERTIES) {
+        this.recentAnalyticsPauses = [];
+        this.breaker.trip(GLOBAL_ANALYTICS_KEY, GLOBAL_PAUSE_MS, 'quotaGlobal', now);
+        log.warn('search analytics paused for every property', { pauseMs: GLOBAL_PAUSE_MS });
+      }
     }
   }
 
-  async listSites(bypassCache?: boolean) {
+  async listSites(bypassCache?: boolean, opts: CallOptions = {}) {
     const res = await this.call({
       tool: 'sites.list',
       bucket: 'other',
       params: {},
       ttlMs: TTL.sites,
       bypassCache,
+      ...opts,
       run: (o) => this.api.listSites(o),
     });
     if (!this.allowed) return res;
     return { ...res, value: res.value.filter((s) => s.siteUrl && this.allowed!.has(normalizeKnownSiteUrl(s.siteUrl))) };
   }
 
-  async getSite(siteUrl: string, bypassCache?: boolean) {
+  async getSite(siteUrl: string, bypassCache?: boolean, opts: CallOptions = {}) {
     const site = this.site(siteUrl);
     return this.call({
       tool: 'sites.get',
@@ -270,11 +348,12 @@ export class GscService {
       params: { site },
       ttlMs: TTL.sites,
       bypassCache,
+      ...opts,
       run: (o) => this.api.getSite(site, o),
     });
   }
 
-  async listSitemaps(siteUrl: string, sitemapIndex?: string, bypassCache?: boolean) {
+  async listSitemaps(siteUrl: string, sitemapIndex?: string, bypassCache?: boolean, opts: CallOptions = {}) {
     const site = this.site(siteUrl);
     return this.call({
       tool: 'sitemaps.list',
@@ -283,11 +362,12 @@ export class GscService {
       params: { site, sitemapIndex },
       ttlMs: TTL.sitemaps,
       bypassCache,
+      ...opts,
       run: (o) => this.api.listSitemaps(site, sitemapIndex, o),
     });
   }
 
-  async getSitemap(siteUrl: string, feedpath: string, bypassCache?: boolean) {
+  async getSitemap(siteUrl: string, feedpath: string, bypassCache?: boolean, opts: CallOptions = {}) {
     const site = this.site(siteUrl);
     return this.call({
       tool: 'sitemaps.get',
@@ -296,11 +376,12 @@ export class GscService {
       params: { site, feedpath },
       ttlMs: TTL.sitemaps,
       bypassCache,
+      ...opts,
       run: (o) => this.api.getSitemap(site, feedpath, o),
     });
   }
 
-  async querySearchAnalytics(siteUrl: string, request: SearchAnalyticsQueryRequest, bypassCache?: boolean) {
+  async querySearchAnalytics(siteUrl: string, request: SearchAnalyticsQueryRequest, bypassCache?: boolean, opts: CallOptions = {}) {
     const site = this.site(siteUrl);
     // Spell out Google's defaults so equivalent requests share a cache entry.
     const body: SearchAnalyticsQueryRequest = {
@@ -320,6 +401,7 @@ export class GscService {
       params: { site, body },
       ttlMs: fresh ? TTL.analyticsFresh : TTL.analyticsFinal,
       bypassCache,
+      ...opts,
       run: (o) => this.api.querySearchAnalytics(site, body, o),
     });
   }
@@ -365,7 +447,8 @@ export class GscService {
         urlInspectionToday: { used, limit: daily.limit, remaining: Math.max(0, daily.limit - used) },
         urlInspectionThisMinute: window(inspection),
         searchAnalyticsThisMinute: window(analytics),
-        searchAnalyticsCooldownSeconds: Math.ceil((this.breaker.check(`searchAnalytics:${site}`, now)?.remainingMs ?? 0) / 1000),
+        searchAnalyticsCooldownSeconds: Math.ceil((this.openPause({ bucket: 'searchAnalytics', siteUrl: site }, now)?.remainingMs ?? 0) / 1000),
+        urlInspectionCooldownSeconds: Math.ceil((this.openPause({ bucket: 'urlInspection', siteUrl: site }, now)?.remainingMs ?? 0) / 1000),
       };
     });
     const other = limitsFor('other', undefined, this.opts.safetyFactor).windows.map((w) => ({

@@ -12,8 +12,8 @@ export function registerSiteTools(server: McpServer, { service, logger }: ToolDe
       inputSchema: { bypassCache: bypassCacheSchema },
       annotations: READ_ONLY,
     },
-    handle(logger, async ({ bypassCache }) => {
-      const { value, cached } = await service.listSites(bypassCache);
+    handle(logger, async ({ bypassCache }, { signal }) => {
+      const { value, cached } = await service.listSites(bypassCache, { signal });
       return { sites: value.map((s) => ({ siteUrl: s.siteUrl, permissionLevel: s.permissionLevel })), count: value.length, cached };
     }),
   );
@@ -26,8 +26,8 @@ export function registerSiteTools(server: McpServer, { service, logger }: ToolDe
       inputSchema: { siteUrl: siteUrlSchema, bypassCache: bypassCacheSchema },
       annotations: READ_ONLY,
     },
-    handle(logger, async ({ siteUrl, bypassCache }: { siteUrl: string; bypassCache?: boolean }) => {
-      const { value, cached } = await service.getSite(siteUrl, bypassCache);
+    handle(logger, async ({ siteUrl, bypassCache }: { siteUrl: string; bypassCache?: boolean }, { signal }) => {
+      const { value, cached } = await service.getSite(siteUrl, bypassCache, { signal });
       return { site: { siteUrl: value.siteUrl, permissionLevel: value.permissionLevel }, cached };
     }),
   );

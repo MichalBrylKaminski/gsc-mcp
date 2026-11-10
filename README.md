@@ -17,7 +17,7 @@ A read-only [MCP](https://modelcontextprotocol.io) server for the **Google Searc
 | `search_analytics_query` | searchanalytics.query | Clicks, impressions, CTR and position, with all dimensions, filters, search types, aggregation types and data states. `fetchAll` pages automatically |
 | `inspect_url` | urlInspection.index.inspect | Google's indexed view of one URL |
 | `batch_inspect_urls` | urlInspection.index.inspect | Up to 25 URLs, with a compact summary of each |
-| `get_site_overview` | (composite) | Permission level, sitemap health, and totals for the last N days vs. the N days before |
+| `get_site_overview` | (composite) | Permission level, sitemap health, and totals for the last N days vs. the N days before. A failing part is reported in its own section |
 | `get_quota_status` | (local) | Inspections left today per property, per-minute usage, cooldowns, reset time |
 
 Left out on purpose: the write methods (`sites.add/delete`, `sitemaps.submit/delete`) and the Mobile-Friendly Test, which Google retired in December 2023.
@@ -34,7 +34,9 @@ Google's published limits ([source](https://developers.google.com/webmaster-tool
 
 - **Waiting:** if a per-minute window or every concurrency slot is full, the call waits up to `MAX_QUEUE_WAIT_MS` in total for a free slot. After that it fails with `LOCAL_RATE_LIMIT` and `retryAfterSeconds`.
 - **Daily counters:** these reset at midnight Pacific Time, like Google's. They are saved in `/data`, so a restart doesn't reset them.
-- **Load quota:** Search Analytics also has a load quota with no published numbers. Grouping by query and/or page, and long date ranges, use the most of it. Google returns the same error for every exceeded quota, and the server's own pacing already keeps under the per-minute limits, so any Search Analytics quota error is treated as load quota: no retries, and that property's queries pause for 15 minutes, as Google recommends. A daily-quota error pauses them until midnight Pacific.
+- **Load quota:** Search Analytics also has a load quota with no published numbers. Grouping by query and/or page, and long date ranges, use the most of it. Google returns the same error for every exceeded quota, and the server's own pacing already keeps under the per-minute limits, so any Search Analytics quota error is treated as load quota: no retries, and that property's queries pause for 15 minutes, as Google recommends. If errors continue with no successful call in between, the pause steps up to 1 hour and then lasts until midnight Pacific, since Google says repeated errors mean the long-term (daily) quota is used up. A successful call or a new Pacific day starts again at 15 minutes. Quota errors on three properties within 10 minutes also pause Search Analytics for every property for 5 minutes, in case the load quota applies to the whole account. These pauses are kept in memory, so a restart clears them.
+- **URL Inspection quota errors:** the server stays under the per-minute limit, so a quota error from Google usually means the property's 2,000 daily inspections are used up, possibly by other tools. Inspections for that property pause the same way: 15 minutes with no retries, then 1 hour, then until midnight Pacific.
+- **Result size:** `fetchAll` stops at 5,000 rows unless `maxRows` asks for more (up to `GSC_MAX_ROWS_PER_CALL`), so results fit in the bot's context.
 - **Caching:** results are cached to avoid repeating the same queries. Lifetimes:
   - final analytics data: 6 h;
   - fresh analytics data: 5 min;
@@ -139,6 +141,6 @@ src/
 | `AUTH_ERROR` | The key is invalid, deleted or disabled, or the Search Console API isn't enabled in the key's project. |
 | `LOCAL_RATE_LIMIT` | The server is pacing calls. Retry after `retryAfterSeconds`. |
 | `LOAD_QUOTA_COOLDOWN` | Google reported a Search Analytics quota as exceeded (most likely the load quota). Wait 15 minutes, or use shorter ranges and fewer query/page dimensions. |
-| `GOOGLE_QUOTA_EXCEEDED` | Google reported a daily quota as used up. It resets at `resetAt` (midnight Pacific). |
+| `GOOGLE_QUOTA_EXCEEDED` | Google reported a quota as used up. URL Inspection pauses for 15 minutes, then 1 hour, then until `resetAt` (midnight Pacific) if it keeps happening. |
 | `CANCELLED` | The client disconnected, so the server stopped the work. |
 | `DAILY_QUOTA_EXHAUSTED` | The property's URL inspections for today are used up. They reset at `resetAt` (midnight Pacific). |
