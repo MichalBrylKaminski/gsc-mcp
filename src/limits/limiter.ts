@@ -1,7 +1,7 @@
-import { mkdirSync, readFileSync } from 'node:fs';
-import { rename, writeFile } from 'node:fs/promises';
-import { dirname } from 'node:path';
-import { GscToolError } from '../errors.js';
+import { mkdirSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'node:fs';
+import { mkdir, rename, writeFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { cancelledError, GscToolError } from '../errors.js';
 import type { Logger } from '../logger.js';
 import { nextPtMidnight, ptDay, sleep } from '../time.js';
 import type { BucketLimits, WindowSpec } from './quotas.js';
@@ -43,6 +43,25 @@ export class SlidingWindows {
 
   used(spec: WindowSpec, now: number): number {
     return this.prune(spec, now).length;
+  }
+}
+
+/**
+ * Fails fast if `dir` can't hold the quota state. Without it the per-site
+ * daily URL inspection counter would silently reset on every restart.
+ */
+export function ensureWritableDir(dir: string): void {
+  const probe = join(dir, `.write-test-${process.pid}`);
+  try {
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(probe, 'ok');
+    renameSync(probe, `${probe}.renamed`);
+    unlinkSync(`${probe}.renamed`);
+  } catch (err) {
+    throw new Error(
+      `DATA_DIR "${dir}" is not writable (${(err as NodeJS.ErrnoException).code ?? (err as Error).message}). ` +
+        'Daily quota counters must persist across restarts; mount a writable volume there (the container runs as uid 1000).',
+    );
   }
 }
 
@@ -89,9 +108,12 @@ export class DailyCounters {
     this.persist();
   }
 
-  snapshot(now: number): DailyState {
+  /** Raises a counter to at least `value`, e.g. when Google says today's quota is used up. */
+  fill(id: string, value: number, now: number): void {
     const s = this.current(now);
-    return { day: s.day, counts: { ...s.counts } };
+    if ((s.counts[id] ?? 0) >= value) return;
+    s.counts[id] = value;
+    this.persist();
   }
 
   private persist(): void {
@@ -100,12 +122,13 @@ export class DailyCounters {
     if (this.writing) return;
     const file = this.file;
     this.writing = (async () => {
-      mkdirSync(dirname(file), { recursive: true });
       while (this.dirty) {
         this.dirty = false;
         const tmp = `${file}.tmp`;
         try {
-          await writeFile(tmp, JSON.stringify(this.state));
+          await mkdir(dirname(file), { recursive: true });
+          // flush: fsync before rename, so a crash can't leave an empty state file.
+          await writeFile(tmp, JSON.stringify(this.state), { flush: true });
           await rename(tmp, file);
         } catch (err) {
           this.logger?.error('failed to save quota state', { file, error: (err as Error).message });
@@ -129,15 +152,60 @@ export class Semaphore {
 
   constructor(private readonly max: number) {}
 
-  async run<T>(fn: () => Promise<T>): Promise<T> {
-    if (this.active >= this.max) await new Promise<void>((resolve) => this.queue.push(resolve));
-    this.active++;
+  /**
+   * Runs `fn` when a slot is free; fails if no slot frees up within
+   * `maxWaitMs`, or if `signal` aborts while waiting.
+   */
+  async run<T>(fn: () => Promise<T>, maxWaitMs = Infinity, signal?: AbortSignal): Promise<T> {
+    if (signal?.aborted) throw cancelledError();
+    if (this.active < this.max) this.active++;
+    else await this.wait(maxWaitMs, signal); // release() hands its slot straight to us
     try {
       return await fn();
     } finally {
-      this.active--;
-      this.queue.shift()?.();
+      this.release();
     }
+  }
+
+  private release(): void {
+    const next = this.queue.shift();
+    // Pass the slot on without freeing it, so a newcomer can't slip in between.
+    if (next) next();
+    else this.active--;
+  }
+
+  private wait(maxWaitMs: number, signal?: AbortSignal): Promise<void> {
+    return new Promise<void>((resolve, reject) => {
+      let timer: NodeJS.Timeout | undefined;
+      const cleanup = () => {
+        clearTimeout(timer);
+        signal?.removeEventListener('abort', onAbort);
+      };
+      const waiter = () => {
+        cleanup();
+        resolve();
+      };
+      const leave = (err: Error) => {
+        const i = this.queue.indexOf(waiter);
+        if (i >= 0) this.queue.splice(i, 1);
+        cleanup();
+        reject(err);
+      };
+      const onAbort = () => leave(cancelledError());
+      if (Number.isFinite(maxWaitMs)) {
+        timer = setTimeout(
+          () =>
+            leave(
+              new GscToolError('LOCAL_RATE_LIMIT', 'The server is busy with other Google calls; try again shortly.', {
+                retryAfterSeconds: Math.max(1, Math.ceil(maxWaitMs / 1000)),
+              }),
+            ),
+          Math.max(0, maxWaitMs),
+        );
+      }
+      signal?.addEventListener('abort', onAbort, { once: true });
+      this.queue.push(waiter);
+    });
   }
 }
 
@@ -150,12 +218,13 @@ export class RateLimiter {
 
   /**
    * Takes one request slot from every window and daily counter in `limits`.
-   * Waits (up to maxWaitMs) for a full minute/second window; fails at once on
-   * an exhausted daily counter.
+   * Waits for a full minute/second window until `deadline` (default: now +
+   * maxWaitMs); fails at once on an exhausted daily counter.
    */
-  async acquire(limits: BucketLimits): Promise<void> {
-    const start = Date.now();
+  async acquire(limits: BucketLimits, opts: { deadline?: number; signal?: AbortSignal } = {}): Promise<void> {
+    const deadline = opts.deadline ?? Date.now() + this.maxWaitMs;
     for (;;) {
+      if (opts.signal?.aborted) throw cancelledError();
       const now = Date.now();
       for (const d of limits.daily) {
         if (this.daily.used(d.id, now) >= d.limit) {
@@ -173,12 +242,12 @@ export class RateLimiter {
         for (const d of limits.daily) this.daily.increment(d.id, now);
         return;
       }
-      if (now - start + wait > this.maxWaitMs) {
+      if (now + wait > deadline) {
         throw new GscToolError('LOCAL_RATE_LIMIT', 'Too many requests right now; the server is pacing calls to stay within Google limits.', {
           retryAfterSeconds: Math.ceil(wait / 1000),
         });
       }
-      await sleep(wait);
+      await sleep(wait, opts.signal);
     }
   }
 }

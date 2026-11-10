@@ -1,8 +1,9 @@
 import type { AddressInfo } from 'node:net';
-import type { Server } from 'node:http';
+import { request, type Server } from 'node:http';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/streamableHttp.js';
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { loadConfig } from '../src/config.js';
 import { createApp } from '../src/http.js';
 import { silentLogger } from '../src/logger.js';
 import { fakeApi, makeService } from './helpers.js';
@@ -66,5 +67,54 @@ describe('HTTP transport', () => {
     expect(bad.isError).toBe(true);
     expect(JSON.parse((bad.content as { text: string }[])[0]!.text)).toMatchObject({ error: { code: 'INVALID_ARGUMENT' } });
     await client.close();
+  });
+});
+
+describe('HTTP edge cases', () => {
+  const auth = { authorization: `Bearer ${TOKEN}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' };
+
+  it('answers GET and DELETE with 405', async () => {
+    expect((await fetch(`${base}/mcp`, { headers: auth })).status).toBe(405);
+    expect((await fetch(`${base}/mcp`, { method: 'DELETE', headers: auth })).status).toBe(405);
+  });
+
+  it('returns JSON-RPC errors for bad JSON and oversized bodies', async () => {
+    const bad = await fetch(`${base}/mcp`, { method: 'POST', headers: auth, body: '{not json' });
+    expect(bad.status).toBe(400);
+    expect(await bad.json()).toMatchObject({ jsonrpc: '2.0', error: { code: -32700 } });
+    const big = await fetch(`${base}/mcp`, { method: 'POST', headers: auth, body: JSON.stringify({ x: 'a'.repeat(2 * 1024 * 1024) }) });
+    expect(big.status).toBe(413);
+    expect(await big.json()).toMatchObject({ error: { code: -32600 } });
+  });
+
+  it('rejects unknown Host headers when ALLOWED_HOSTS is set', async () => {
+    const app = createApp({
+      authToken: TOKEN,
+      allowedHosts: loadConfig({ MCP_AUTH_TOKEN: TOKEN, GOOGLE_APPLICATION_CREDENTIALS: 'x', ALLOWED_HOSTS: 'LOCALHOST:443, 127.0.0.1' }).ALLOWED_HOSTS,
+      deps: { service: makeService(fakeApi()), logger: silentLogger, maxRowsPerCall: 25_000 },
+      logger: silentLogger,
+    });
+    const s = app.listen(0, '127.0.0.1');
+    await new Promise((r) => s.once('listening', r));
+    const port = (s.address() as AddressInfo).port;
+    const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
+    try {
+      const ok = await fetch(`http://127.0.0.1:${port}/mcp`, { method: 'POST', headers: auth, body });
+      expect(ok.status).toBe(200);
+      const viaName = await fetch(`http://localhost:${port}/mcp`, { method: 'POST', headers: auth, body });
+      expect(viaName.status).toBe(200); // "LOCALHOST:443" was normalised to "localhost"
+      // fetch can't override Host, so use node:http for the DNS-rebinding case.
+      const rebindStatus = await new Promise<number>((resolve, reject) => {
+        const req = request({ host: '127.0.0.1', port, path: '/mcp', method: 'POST', headers: { ...auth, host: 'evil.example' } }, (res) => {
+          res.resume();
+          resolve(res.statusCode ?? 0);
+        });
+        req.on('error', reject);
+        req.end(body);
+      });
+      expect(rebindStatus).toBe(403);
+    } finally {
+      await new Promise((r) => s.close(r));
+    }
   });
 });

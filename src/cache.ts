@@ -49,7 +49,8 @@ export class ResponseCache {
       const hit = this.lru.get(key);
       if (hit) return { value: hit.value as T, hit: true };
       const pending = this.inflight.get(key);
-      if (pending) return { value: (await pending) as T, hit: true };
+      // Joining a call already in flight still costs a Google request, so it isn't a cache hit.
+      if (pending) return { value: (await pending) as T, hit: false };
     }
     const promise = load();
     this.inflight.set(key, promise);

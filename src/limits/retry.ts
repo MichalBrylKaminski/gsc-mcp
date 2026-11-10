@@ -1,10 +1,16 @@
-import { classifyGoogleError, type ClassifiedGoogleError } from '../errors.js';
+import { cancelledError, classifyGoogleError, type ClassifiedGoogleError } from '../errors.js';
 import { sleep } from '../time.js';
 
 export interface RetryOptions {
   maxRetries?: number;
   baseDelayMs?: number;
   maxDelayMs?: number;
+  /** Extra filter: return false to fail at once on an otherwise retryable error. */
+  retryable?: (error: ClassifiedGoogleError) => boolean;
+  /** Epoch ms; a retry that would sleep past it fails with the last error instead. */
+  deadline?: number;
+  /** Stops waiting between attempts when the caller goes away. */
+  signal?: AbortSignal;
   onRetry?: (info: { attempt: number; delayMs: number; error: ClassifiedGoogleError }) => void;
 }
 
@@ -16,43 +22,43 @@ const RETRYABLE = new Set(['rateLimit', 'server', 'network']);
  * daily-quota errors are not retried: retrying soon cannot succeed.
  */
 export async function withRetry<T>(fn: () => Promise<T>, opts: RetryOptions = {}): Promise<T> {
-  const { maxRetries = 3, baseDelayMs = 500, maxDelayMs = 8_000, onRetry } = opts;
+  const { maxRetries = 3, baseDelayMs = 500, maxDelayMs = 8_000, retryable, deadline = Infinity, signal, onRetry } = opts;
   for (let attempt = 0; ; attempt++) {
     try {
       return await fn();
     } catch (err) {
       const c = classifyGoogleError(err);
-      if (attempt >= maxRetries || !RETRYABLE.has(c.kind)) throw err;
+      if (attempt >= maxRetries || !RETRYABLE.has(c.kind) || (retryable && !retryable(c))) throw err;
       // A long Retry-After is better reported to the caller than slept through.
       if ((c.retryAfterMs ?? 0) > maxDelayMs * 4) throw err;
       const backoff = Math.random() * Math.min(maxDelayMs, baseDelayMs * 2 ** attempt);
       const delayMs = Math.max(backoff, c.retryAfterMs ?? 0);
+      if (Date.now() + delayMs >= deadline) throw err;
       onRetry?.({ attempt: attempt + 1, delayMs, error: c });
-      await sleep(delayMs);
+      await sleep(delayMs, signal);
+      if (signal?.aborted) throw cancelledError();
     }
   }
 }
 
 /** Blocks a key (e.g. one site's Search Analytics) for a cooldown period. */
 export class CircuitBreaker {
-  private openUntil = new Map<string, number>();
+  private entries = new Map<string, { until: number; reason: string }>();
 
-  trip(key: string, ms: number, now = Date.now()): void {
-    this.openUntil.set(key, now + ms);
+  trip(key: string, ms: number, reason: string, now = Date.now()): void {
+    const prev = this.entries.get(key);
+    if (prev && prev.until > now + ms) return;
+    this.entries.set(key, { until: now + ms, reason });
   }
 
-  /** Remaining cooldown in ms, or 0 if the key is not blocked. */
-  remaining(key: string, now = Date.now()): number {
-    const until = this.openUntil.get(key);
-    if (until === undefined) return 0;
-    if (until <= now) {
-      this.openUntil.delete(key);
-      return 0;
+  /** The active cooldown for `key`, or undefined if it isn't blocked. */
+  check(key: string, now = Date.now()): { remainingMs: number; reason: string } | undefined {
+    const e = this.entries.get(key);
+    if (!e) return undefined;
+    if (e.until <= now) {
+      this.entries.delete(key);
+      return undefined;
     }
-    return until - now;
-  }
-
-  open(now = Date.now()): { key: string; remainingMs: number }[] {
-    return [...this.openUntil.keys()].map((key) => ({ key, remainingMs: this.remaining(key, now) })).filter((e) => e.remainingMs > 0);
+    return { remainingMs: e.until - now, reason: e.reason };
   }
 }

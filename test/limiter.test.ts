@@ -1,9 +1,9 @@
-import { mkdtempSync, readFileSync } from 'node:fs';
+import { mkdtempSync, readFileSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { GscToolError } from '../src/errors.js';
-import { DailyCounters, RateLimiter, Semaphore, SlidingWindows } from '../src/limits/limiter.js';
+import { DailyCounters, ensureWritableDir, RateLimiter, Semaphore, SlidingWindows } from '../src/limits/limiter.js';
 import { limitsFor } from '../src/limits/quotas.js';
 import { nextPtMidnight, ptDay } from '../src/time.js';
 
@@ -58,6 +58,13 @@ describe('RateLimiter', () => {
     expect(err.details.retryAfterSeconds).toBe(61);
   });
 
+  it('shares one deadline instead of its own maxWaitMs when given one', async () => {
+    const limiter = new RateLimiter(new SlidingWindows(), new DailyCounters(undefined), 120_000);
+    const limits = { windows: [{ id: 'x', limit: 1, windowMs: 60_000 }], daily: [] };
+    await limiter.acquire(limits);
+    await expect(limiter.acquire(limits, { deadline: Date.now() + 1_000 })).rejects.toMatchObject({ code: 'LOCAL_RATE_LIMIT' });
+  });
+
   it('enforces the per-site daily URL inspection limit and resets at PT midnight', async () => {
     const limiter = new RateLimiter(new SlidingWindows(), new DailyCounters(undefined), 0);
     const limits = { windows: [], daily: [{ id: 'd', limit: 2 }] };
@@ -96,6 +103,36 @@ describe('DailyCounters persistence', () => {
   });
 });
 
+describe('quota state directory', () => {
+  it('rejects a DATA_DIR that cannot be written at startup', () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gsc-mcp-'));
+    const file = join(dir, 'not-a-dir');
+    writeFileSync(file, '');
+    expect(() => ensureWritableDir(join(file, 'data'))).toThrow(/not writable/);
+    expect(() => ensureWritableDir(join(dir, 'data'))).not.toThrow();
+  });
+
+  it('logs instead of crashing when a later save fails', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gsc-mcp-'));
+    const file = join(dir, 'not-a-dir');
+    writeFileSync(file, '');
+    const error = vi.fn();
+    const counters = new DailyCounters(join(file, 'data', 'quota.json'), { debug() {}, info() {}, warn() {}, error });
+    counters.increment('d', Date.now());
+    await counters.flush();
+    expect(error).toHaveBeenCalledWith('failed to save quota state', expect.anything());
+    expect(counters.used('d', Date.now())).toBe(1);
+  });
+
+  it('fill raises a counter but never lowers it', () => {
+    const c = new DailyCounters(undefined);
+    const now = Date.now();
+    c.fill('d', 5, now);
+    c.fill('d', 3, now);
+    expect(c.used('d', now)).toBe(5);
+  });
+});
+
 describe('PT time helpers', () => {
   it('finds the next Pacific midnight, including on DST change days', () => {
     // Normal day (PST, UTC-8).
@@ -121,5 +158,54 @@ describe('Semaphore', () => {
       });
     await Promise.all([task(), task(), task(), task(), task()]);
     expect(peak).toBe(2);
+  });
+
+  it('hands a freed slot to the next waiter, so a newcomer cannot overshoot', async () => {
+    const sem = new Semaphore(1);
+    let active = 0;
+    let peak = 0;
+    const track = async () => {
+      active++;
+      peak = Math.max(peak, active);
+      await new Promise((r) => setTimeout(r, 1));
+      active--;
+    };
+    let releaseA!: () => void;
+    const a = sem.run(async () => {
+      active++;
+      await new Promise<void>((r) => (releaseA = r));
+      active--;
+    });
+    const b = sem.run(track);
+    releaseA();
+    // Arrives in the gap between A releasing and B resuming.
+    const c = a.then(() => sem.run(track));
+    await Promise.all([a, b, c]);
+    expect(peak).toBe(1);
+  });
+
+  it('stops waiting when the caller aborts', async () => {
+    const sem = new Semaphore(1);
+    let release!: () => void;
+    const busy = sem.run(() => new Promise<void>((r) => (release = r)));
+    const controller = new AbortController();
+    const waiting = sem.run(async () => 'never', Infinity, controller.signal);
+    controller.abort();
+    await expect(waiting).rejects.toMatchObject({ code: 'CANCELLED' });
+    release();
+    await busy;
+    await expect(sem.run(async () => 'free')).resolves.toBe('free');
+  });
+
+  it('gives up waiting for a slot after maxWaitMs', async () => {
+    const sem = new Semaphore(1);
+    let release!: () => void;
+    const busy = sem.run(() => new Promise<void>((r) => (release = r)));
+    await expect(sem.run(async () => 'late', 10)).rejects.toMatchObject({ code: 'LOCAL_RATE_LIMIT' });
+    // The timed-out waiter must not hold a place in the queue.
+    const next = sem.run(async () => 'next', 1_000);
+    release();
+    await busy;
+    await expect(next).resolves.toBe('next');
   });
 });

@@ -1,3 +1,5 @@
+import { nextPtMidnight } from './time.js';
+
 export type ErrorCode =
   | 'INVALID_ARGUMENT'
   | 'SITE_NOT_ALLOWED'
@@ -10,6 +12,7 @@ export type ErrorCode =
   | 'NOT_FOUND'
   | 'AUTH_ERROR'
   | 'UPSTREAM_ERROR'
+  | 'CANCELLED'
   | 'INTERNAL';
 
 export interface ErrorDetails {
@@ -52,7 +55,19 @@ export interface ClassifiedGoogleError {
 
 const RATE_REASONS = new Set(['rateLimitExceeded', 'userRateLimitExceeded', 'quotaExceeded', 'RESOURCE_EXHAUSTED']);
 const DAILY_REASONS = new Set(['dailyLimitExceeded', 'dailyLimitExceededUnreg']);
-const NETWORK_CODES = new Set(['ECONNRESET', 'ETIMEDOUT', 'ECONNREFUSED', 'EAI_AGAIN', 'ENOTFOUND', 'UND_ERR_SOCKET']);
+// System error codes as surfaced by gaxios 8 (node-fetch) on Node.
+const NETWORK_CODES = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ECONNABORTED',
+  'ETIMEDOUT',
+  'EPIPE',
+  'EAI_AGAIN',
+  'ENOTFOUND',
+  'EHOSTUNREACH',
+  'ENETUNREACH',
+  'ERR_STREAM_PREMATURE_CLOSE',
+]);
 
 function header(headers: unknown, name: string): string | undefined {
   if (!headers) return undefined;
@@ -78,7 +93,10 @@ export function classifyGoogleError(err: unknown): ClassifiedGoogleError {
     response?: {
       status?: number;
       headers?: unknown;
-      data?: { error?: string | { message?: string; status?: string; errors?: { reason?: string }[] }; error_description?: string };
+      data?: {
+        error?: string | { message?: string; status?: string; errors?: { reason?: string }[]; details?: { metadata?: { quota_limit?: string } }[] };
+        error_description?: string;
+      };
     };
   };
   const status = e?.response?.status ?? (typeof e?.status === 'number' ? e.status : undefined);
@@ -97,7 +115,9 @@ export function classifyGoogleError(err: unknown): ClassifiedGoogleError {
     return { ...base, kind: typeof e?.code === 'string' && NETWORK_CODES.has(e.code) ? 'network' : 'other' };
   }
   if (status === 429 || (status === 403 && reason && (RATE_REASONS.has(reason) || DAILY_REASONS.has(reason)))) {
-    if (reason && DAILY_REASONS.has(reason)) return { ...base, kind: 'dailyQuota' };
+    // Newer Google errors report daily limits as RESOURCE_EXHAUSTED with a "per day" message or quota_limit.
+    const perDay = /per day|daily/i.test(message) || (apiError?.details ?? []).some((d) => /PerDay/i.test(d.metadata?.quota_limit ?? ''));
+    if ((reason && DAILY_REASONS.has(reason)) || perDay) return { ...base, kind: 'dailyQuota' };
     if (/load quota/i.test(message)) return { ...base, kind: 'loadQuota' };
     return { ...base, kind: 'rateLimit' };
   }
@@ -107,6 +127,34 @@ export function classifyGoogleError(err: unknown): ClassifiedGoogleError {
   if (status === 404) return { ...base, kind: 'notFound' };
   if (status === 400) return { ...base, kind: 'badRequest' };
   return { ...base, kind: 'other' };
+}
+
+/** The client went away, so the work was abandoned. */
+export const cancelledError = () => new GscToolError('CANCELLED', 'The request was cancelled because the client disconnected.');
+
+/** The caller's time budget (e.g. a batch's deadline) ran out. */
+export const deadlineError = () =>
+  new GscToolError('LOCAL_RATE_LIMIT', 'Time limit reached before Google answered; retry the remaining work in another call.', { retryAfterSeconds: 1 });
+
+/**
+ * Google returns the same error for every exceeded quota, so a load-quota
+ * error can't be told apart from a per-minute one. For Search Analytics the
+ * local limiter already keeps under the per-minute limits, so a quota error
+ * that still arrives is treated as load quota: wait 15 minutes, as Google advises.
+ */
+export function loadQuotaError(siteUrl: string | undefined, googleMessage: string): GscToolError {
+  const site = siteUrl ? ` for "${siteUrl}"` : '';
+  return new GscToolError(
+    'LOAD_QUOTA_COOLDOWN',
+    `Google reported a Search Analytics quota as exceeded${site} (most likely the load quota). ` +
+      `Queries for this property are paused for 15 minutes; use shorter date ranges and fewer page/query dimensions. Google said: ${googleMessage}`,
+    { retryAfterSeconds: 15 * 60 },
+  );
+}
+
+/** How long to hold off after a rate limit that survived retries. */
+export function rateLimitCooldownMs(c: ClassifiedGoogleError): number {
+  return Math.max(c.retryAfterMs ?? 0, 60_000);
 }
 
 export interface ErrorContext {
@@ -142,16 +190,17 @@ export function toToolError(err: unknown, ctx: ErrorContext = {}): GscToolError 
       );
     case 'rateLimit':
       return new GscToolError('GOOGLE_RATE_LIMIT', `Google rate limit reached: ${c.message}`, {
-        retryAfterSeconds: Math.ceil((c.retryAfterMs ?? 60_000) / 1000),
+        retryAfterSeconds: Math.ceil(rateLimitCooldownMs(c) / 1000),
       });
     case 'loadQuota':
-      return new GscToolError(
-        'LOAD_QUOTA_COOLDOWN',
-        `Search Analytics load quota exceeded${site}. Use shorter date ranges, fewer page/query dimensions, or wait 15 minutes. Google said: ${c.message}`,
-        { retryAfterSeconds: 15 * 60 },
-      );
-    case 'dailyQuota':
-      return new GscToolError('GOOGLE_QUOTA_EXCEEDED', `Google daily quota exceeded: ${c.message}`);
+      return loadQuotaError(ctx.siteUrl, c.message);
+    case 'dailyQuota': {
+      const resetAt = nextPtMidnight(Date.now());
+      return new GscToolError('GOOGLE_QUOTA_EXCEEDED', `Google daily quota exceeded${site}; it resets at midnight Pacific Time. Google said: ${c.message}`, {
+        resetAt: new Date(resetAt).toISOString(),
+        retryAfterSeconds: Math.ceil((resetAt - Date.now()) / 1000),
+      });
+    }
     case 'server':
     case 'network':
       return new GscToolError('UPSTREAM_ERROR', `Google API is unavailable right now (${c.status ?? c.message}). Try again shortly.`);

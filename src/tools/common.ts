@@ -33,11 +33,19 @@ export function fail(err: unknown, logger: Logger): CallToolResult {
   return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: { code: e.code, message: e.message, ...e.details } }) }] };
 }
 
+/** What a tool body gets besides its arguments. `signal` aborts when the client goes away. */
+export interface ToolContext {
+  signal: AbortSignal;
+}
+
 /** Wraps a tool body so every failure becomes an MCP tool error result. */
-export function handle<A>(logger: Logger, fn: (args: A) => Promise<Record<string, unknown>>): (args: A) => Promise<CallToolResult> {
-  return async (args) => {
+export function handle<A>(
+  logger: Logger,
+  fn: (args: A, ctx: ToolContext) => Promise<Record<string, unknown>>,
+): (args: A, extra: ToolContext) => Promise<CallToolResult> {
+  return async (args, extra) => {
     try {
-      return ok(await fn(args));
+      return ok(await fn(args, { signal: extra.signal }));
     } catch (err) {
       return fail(err, logger);
     }

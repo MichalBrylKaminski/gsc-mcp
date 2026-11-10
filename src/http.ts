@@ -66,5 +66,14 @@ export function createApp({ authToken, allowedHosts, deps, logger }: HttpOptions
   app.use((_req, res) => {
     res.status(404).json({ error: 'Not found' });
   });
+  // Body-parser failures (bad JSON, too large) as JSON-RPC errors instead of Express's HTML page.
+  app.use((err: { status?: number; type?: string }, _req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) return next(err);
+    const status = err.status && err.status >= 400 && err.status < 500 ? err.status : 500;
+    const message = err.type === 'entity.parse.failed' ? 'Parse error' : status === 413 ? 'Request body too large' : 'Invalid request';
+    const code = err.type === 'entity.parse.failed' ? -32700 : status === 500 ? -32603 : -32600;
+    if (status === 500) logger.error('http error', { type: err.type });
+    res.status(status).json({ jsonrpc: '2.0', error: { code, message: status === 500 ? 'Internal server error' : message }, id: null });
+  });
   return app;
 }

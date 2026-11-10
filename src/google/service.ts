@@ -1,11 +1,11 @@
 import { cacheKey, ResponseCache, TTL } from '../cache.js';
-import { classifyGoogleError, GscToolError, toToolError } from '../errors.js';
+import { cancelledError, classifyGoogleError, deadlineError, GscToolError, loadQuotaError, toToolError, type ClassifiedGoogleError } from '../errors.js';
 import { DailyCounters, RateLimiter, Semaphore, SlidingWindows } from '../limits/limiter.js';
 import { limitsFor, LOAD_QUOTA_COOLDOWN_MS, type Bucket } from '../limits/quotas.js';
 import { CircuitBreaker, withRetry } from '../limits/retry.js';
 import type { Logger } from '../logger.js';
 import { nextPtMidnight } from '../time.js';
-import type { GscApi, InspectUrlIndexRequest, SearchAnalyticsQueryRequest } from './client.js';
+import type { GscApi, InspectUrlIndexRequest, RequestOptions, SearchAnalyticsQueryRequest } from './client.js';
 
 export interface GscServiceOptions {
   serviceAccountEmail: string;
@@ -19,19 +19,65 @@ export interface GscServiceOptions {
   logger: Logger;
 }
 
+const invalidSite = (siteUrl: string) =>
+  new GscToolError('INVALID_ARGUMENT', `"${siteUrl}" is not a valid property. Use "https://www.example.com/" or "sc-domain:example.com".`);
+
 /**
- * GSC URL-prefix properties are exact URLs ending in "/"; domain properties
- * are "sc-domain:<host>". Fix the common slips (missing slash, letter case).
+ * GSC URL-prefix properties are exact http(s) URLs ending in "/"; domain
+ * properties are "sc-domain:<host>". Fix the common slips (missing slash,
+ * letter case) and reject anything else before it costs quota. Hosts are
+ * parsed the way browsers do, so internationalized domains become punycode
+ * (bücher.de -> xn--bcher-kva.de) on both properties and inspected URLs.
  */
 export function normalizeSiteUrl(siteUrl: string): string {
   const s = siteUrl.trim();
-  if (/^sc-domain:/i.test(s)) return `sc-domain:${s.slice('sc-domain:'.length).toLowerCase()}`;
-  try {
-    const u = new URL(s);
-    return u.pathname.endsWith('/') ? u.href : `${u.href}/`;
-  } catch {
-    throw new GscToolError('INVALID_ARGUMENT', `"${siteUrl}" is not a valid property. Use "https://www.example.com/" or "sc-domain:example.com".`);
+  if (/^sc-domain:/i.test(s)) {
+    const domain = s.slice('sc-domain:'.length);
+    if (!domain || /[/\\?#@:\s]/.test(domain)) throw invalidSite(siteUrl);
+    let host: string;
+    try {
+      host = new URL(`http://${domain}`).hostname;
+    } catch {
+      throw invalidSite(siteUrl);
+    }
+    if (!/^[^.]+(\.[^.]+)+$/.test(host)) throw invalidSite(siteUrl);
+    return `sc-domain:${host}`;
   }
+  // A bare "?" or "#" leaves u.search/u.hash empty, so check the raw string.
+  if (/[?#]/.test(s)) throw invalidSite(siteUrl);
+  let u: URL;
+  try {
+    u = new URL(s);
+  } catch {
+    throw invalidSite(siteUrl);
+  }
+  if ((u.protocol !== 'http:' && u.protocol !== 'https:') || u.username || u.password) throw invalidSite(siteUrl);
+  return `${u.origin}${u.pathname.endsWith('/') ? u.pathname : `${u.pathname}/`}`;
+}
+
+/** normalizeSiteUrl for values Google returned: never throws, so one odd property can't break a listing. */
+export function normalizeKnownSiteUrl(siteUrl: string): string {
+  try {
+    return normalizeSiteUrl(siteUrl);
+  } catch {
+    return siteUrl.trim();
+  }
+}
+
+/** Whether `url` belongs to property `site` (already normalized). */
+export function urlInProperty(url: string, site: string): boolean {
+  let u: URL;
+  try {
+    u = new URL(url);
+  } catch {
+    return false;
+  }
+  if (u.protocol !== 'http:' && u.protocol !== 'https:') return false;
+  if (site.startsWith('sc-domain:')) {
+    const domain = site.slice('sc-domain:'.length);
+    return u.hostname === domain || u.hostname.endsWith(`.${domain}`);
+  }
+  return u.href.startsWith(site);
 }
 
 interface CallSpec<T> {
@@ -41,8 +87,20 @@ interface CallSpec<T> {
   params: unknown;
   ttlMs: number;
   bypassCache?: boolean;
-  run: () => Promise<T>;
+  /** Aborts waiting and the Google request when the client goes away. */
+  signal?: AbortSignal;
+  /** Epoch ms after which the call gives up, including any queueing and retries. */
+  deadline?: number;
+  run: (opts: RequestOptions) => Promise<T>;
 }
+
+/** Per-call cancellation, for callers that have a client signal or a time budget. */
+export interface CallOptions {
+  signal?: AbortSignal;
+  deadline?: number;
+}
+
+const MAX_JOIN_ATTEMPTS = 3;
 
 export class GscService {
   readonly limiter: RateLimiter;
@@ -73,53 +131,120 @@ export class GscService {
   private async call<T>(spec: CallSpec<T>): Promise<{ value: T; cached: boolean }> {
     const started = Date.now();
     const log = this.opts.logger;
-    const breakerKey = spec.bucket === 'searchAnalytics' && spec.siteUrl ? `searchAnalytics:${spec.siteUrl}` : undefined;
     try {
-      const { value, hit } = await this.cache.getOrLoad(
-        cacheKey(spec.tool, spec.params),
-        spec.ttlMs,
-        async () => {
-          if (breakerKey) {
-            const remaining = this.breaker.remaining(breakerKey);
-            if (remaining > 0) {
-              throw new GscToolError(
-                'LOAD_QUOTA_COOLDOWN',
-                `Search Analytics for "${spec.siteUrl}" is cooling down after Google reported its load quota as exceeded. ` +
-                  `Retry in ${Math.ceil(remaining / 60_000)} min, or use cached/narrower queries.`,
-                { retryAfterSeconds: Math.ceil(remaining / 1000) },
-              );
-            }
-          }
-          const limits = limitsFor(spec.bucket, spec.siteUrl, this.opts.safetyFactor);
-          try {
-            return await withRetry(
-              async () => {
-                await this.limiter.acquire(limits);
-                return this.semaphore.run(spec.run);
-              },
-              {
-                ...this.opts.retry,
-                onRetry: ({ attempt, delayMs, error }) =>
-                  log.warn('retrying google call', { tool: spec.tool, site: spec.siteUrl, attempt, delayMs: Math.round(delayMs), status: error.status, reason: error.reason }),
-              },
-            );
-          } catch (err) {
-            const kind = err instanceof GscToolError ? undefined : classifyGoogleError(err).kind;
-            if (breakerKey && (kind === 'loadQuota' || kind === 'rateLimit')) {
-              this.breaker.trip(breakerKey, LOAD_QUOTA_COOLDOWN_MS);
-              log.warn('search analytics circuit opened', { site: spec.siteUrl, kind, cooldownMs: LOAD_QUOTA_COOLDOWN_MS });
-            }
-            throw err;
-          }
-        },
-        spec.bypassCache,
-      );
-      log.info('tool call', { tool: spec.tool, site: spec.siteUrl, cached: hit, ms: Date.now() - started });
-      return { value, cached: hit };
+      for (let attempt = 1; ; attempt++) {
+        try {
+          const { value, hit } = await this.cache.getOrLoad(cacheKey(spec.tool, spec.params), spec.ttlMs, () => this.load(spec), spec.bypassCache);
+          log.info('tool call', { tool: spec.tool, site: spec.siteUrl, cached: hit, ms: Date.now() - started });
+          return { value, cached: hit };
+        } catch (err) {
+          // We may have joined another client's in-flight call that was then cancelled; that isn't our failure.
+          const joinedCancelled = err instanceof GscToolError && err.code === 'CANCELLED' && !spec.signal?.aborted;
+          if (!joinedCancelled || attempt >= MAX_JOIN_ATTEMPTS) throw err;
+        }
+      }
     } catch (err) {
       const toolErr = toToolError(err, { siteUrl: spec.siteUrl, serviceAccountEmail: this.opts.serviceAccountEmail });
-      log.warn('tool call failed', { tool: spec.tool, site: spec.siteUrl, code: toolErr.code, ms: Date.now() - started });
+      log.warn('tool call failed', { tool: spec.tool, site: spec.siteUrl, code: toolErr.code, message: toolErr.message, ms: Date.now() - started });
       throw toolErr;
+    }
+  }
+
+  /** One Google call through the breaker, concurrency cap, rate limiter and retries. */
+  private async load<T>(spec: CallSpec<T>): Promise<T> {
+    this.checkBreaker(spec);
+    const limits = limitsFor(spec.bucket, spec.siteUrl, this.opts.safetyFactor);
+    const { signal, deadline } = spec;
+    const log = this.opts.logger;
+    try {
+      return await withRetry(
+        () => {
+          // Don't spend quota on a request whose caller has already given up.
+          if (deadline !== undefined && Date.now() >= deadline) throw deadlineError();
+          // One queueing budget per attempt, shared by the concurrency cap and the rate limiter.
+          const queueDeadline = Math.min(Date.now() + this.opts.maxQueueWaitMs, deadline ?? Infinity);
+          // Take the rate-limit slot only once a concurrency slot is held, so a
+          // request is counted when it is actually sent.
+          return this.semaphore.run(
+            async () => {
+              this.checkBreaker(spec); // before taking a rate-limit slot it wouldn't use
+              await this.limiter.acquire(limits, { deadline: queueDeadline, signal });
+              // Another call may have paused this site while we queued.
+              this.checkBreaker(spec);
+              try {
+                return await spec.run({ signal: requestSignal(signal, deadline) });
+              } catch (err) {
+                // Record quota state before the slot is released, so queued calls see it.
+                if (!signal?.aborted) this.noteQuotaError(spec, classifyGoogleError(err));
+                throw err;
+              }
+            },
+            queueDeadline - Date.now(),
+            signal,
+          );
+        },
+        {
+          ...this.opts.retry,
+          // Any Search Analytics quota error is treated as load quota (see loadQuotaError), and retrying adds load.
+          retryable: spec.bucket === 'searchAnalytics' ? (c) => c.kind !== 'rateLimit' : undefined,
+          deadline,
+          signal,
+          onRetry: ({ attempt, delayMs, error }) =>
+            log.warn('retrying google call', { tool: spec.tool, site: spec.siteUrl, attempt, delayMs: Math.round(delayMs), status: error.status, reason: error.reason }),
+        },
+      );
+    } catch (err) {
+      if (err instanceof GscToolError) throw err;
+      if (signal?.aborted) throw cancelledError();
+      const c = classifyGoogleError(err);
+      if (deadline !== undefined && Date.now() >= deadline && c.status === undefined) throw deadlineError();
+      if (this.breakerKey(spec) && (c.kind === 'loadQuota' || c.kind === 'rateLimit')) throw loadQuotaError(spec.siteUrl, c.message);
+      throw err;
+    }
+  }
+
+  private breakerKey(spec: { bucket: Bucket; siteUrl?: string }): string | undefined {
+    return spec.bucket === 'searchAnalytics' && spec.siteUrl ? `searchAnalytics:${spec.siteUrl}` : undefined;
+  }
+
+  private checkBreaker(spec: CallSpec<unknown>): void {
+    const key = this.breakerKey(spec);
+    const open = key ? this.breaker.check(key) : undefined;
+    if (!open) return;
+    const retryAfterSeconds = Math.ceil(open.remainingMs / 1000);
+    if (open.reason === 'dailyQuota') {
+      const resetAt = new Date(Date.now() + open.remainingMs).toISOString();
+      throw new GscToolError(
+        'GOOGLE_QUOTA_EXCEEDED',
+        `Search Analytics for "${spec.siteUrl}" is paused until midnight Pacific Time (${resetAt}) because Google reported a daily quota as exceeded.`,
+        { resetAt, retryAfterSeconds },
+      );
+    }
+    throw new GscToolError(
+      'LOAD_QUOTA_COOLDOWN',
+      `Search Analytics for "${spec.siteUrl}" is cooling down because Google reported a quota as exceeded (most likely its load quota). ` +
+        `Retry in ${Math.ceil(retryAfterSeconds / 60)} min, or repeat earlier (cached) queries.`,
+      { retryAfterSeconds },
+    );
+  }
+
+  /** Records what a Google error says about quota, so later calls don't repeat it. */
+  private noteQuotaError(spec: CallSpec<unknown>, c: ClassifiedGoogleError): void {
+    const log = this.opts.logger;
+    const key = this.breakerKey(spec);
+    if (key && (c.kind === 'loadQuota' || c.kind === 'rateLimit')) {
+      this.breaker.trip(key, LOAD_QUOTA_COOLDOWN_MS, 'loadQuota');
+      log.warn('search analytics paused', { site: spec.siteUrl, kind: c.kind, cooldownMs: LOAD_QUOTA_COOLDOWN_MS });
+    }
+    if (key && c.kind === 'dailyQuota') {
+      const now = Date.now();
+      this.breaker.trip(key, nextPtMidnight(now) - now, 'dailyQuota', now);
+      log.warn('search analytics paused until PT midnight', { site: spec.siteUrl });
+    }
+    if (c.kind === 'dailyQuota' && spec.bucket === 'urlInspection' && spec.siteUrl) {
+      const daily = limitsFor('urlInspection', spec.siteUrl, this.opts.safetyFactor).daily[0]!;
+      this.limiter.daily.fill(daily.id, daily.limit, Date.now());
+      log.warn('google reported daily inspection quota exhausted', { site: spec.siteUrl });
     }
   }
 
@@ -130,10 +255,10 @@ export class GscService {
       params: {},
       ttlMs: TTL.sites,
       bypassCache,
-      run: () => this.api.listSites(),
+      run: (o) => this.api.listSites(o),
     });
     if (!this.allowed) return res;
-    return { ...res, value: res.value.filter((s) => s.siteUrl && this.allowed!.has(normalizeSiteUrl(s.siteUrl))) };
+    return { ...res, value: res.value.filter((s) => s.siteUrl && this.allowed!.has(normalizeKnownSiteUrl(s.siteUrl))) };
   }
 
   async getSite(siteUrl: string, bypassCache?: boolean) {
@@ -145,7 +270,7 @@ export class GscService {
       params: { site },
       ttlMs: TTL.sites,
       bypassCache,
-      run: () => this.api.getSite(site),
+      run: (o) => this.api.getSite(site, o),
     });
   }
 
@@ -158,7 +283,7 @@ export class GscService {
       params: { site, sitemapIndex },
       ttlMs: TTL.sitemaps,
       bypassCache,
-      run: () => this.api.listSitemaps(site, sitemapIndex),
+      run: (o) => this.api.listSitemaps(site, sitemapIndex, o),
     });
   }
 
@@ -171,12 +296,22 @@ export class GscService {
       params: { site, feedpath },
       ttlMs: TTL.sitemaps,
       bypassCache,
-      run: () => this.api.getSitemap(site, feedpath),
+      run: (o) => this.api.getSitemap(site, feedpath, o),
     });
   }
 
-  async querySearchAnalytics(siteUrl: string, body: SearchAnalyticsQueryRequest, bypassCache?: boolean) {
+  async querySearchAnalytics(siteUrl: string, request: SearchAnalyticsQueryRequest, bypassCache?: boolean) {
     const site = this.site(siteUrl);
+    // Spell out Google's defaults so equivalent requests share a cache entry.
+    const body: SearchAnalyticsQueryRequest = {
+      ...request,
+      dimensions: request.dimensions?.length ? request.dimensions : undefined,
+      type: request.type ?? 'web',
+      dataState: request.dataState ?? 'final',
+      aggregationType: request.aggregationType ?? 'auto',
+      rowLimit: request.rowLimit ?? 1_000,
+      startRow: request.startRow ?? 0,
+    };
     const fresh = body.dataState === 'all' || body.dataState === 'hourly_all';
     return this.call({
       tool: 'searchanalytics.query',
@@ -185,13 +320,20 @@ export class GscService {
       params: { site, body },
       ttlMs: fresh ? TTL.analyticsFresh : TTL.analyticsFinal,
       bypassCache,
-      run: () => this.api.querySearchAnalytics(site, body),
+      run: (o) => this.api.querySearchAnalytics(site, body, o),
     });
   }
 
-  async inspectUrl(siteUrl: string, inspectionUrl: string, languageCode?: string, bypassCache?: boolean) {
+  async inspectUrl(siteUrl: string, inspectionUrl: string, languageCode?: string, bypassCache?: boolean, opts: CallOptions = {}) {
     const site = this.site(siteUrl);
-    const body: InspectUrlIndexRequest = { siteUrl: site, inspectionUrl, languageCode };
+    if (!urlInProperty(inspectionUrl, site)) {
+      throw new GscToolError('INVALID_ARGUMENT', `"${inspectionUrl}" is not part of property "${site}". Inspect only URLs within the property.`);
+    }
+    // Canonical form, so spelling variants of one URL share a cache entry and one daily inspection.
+    const parsed = new URL(inspectionUrl);
+    parsed.hash = ''; // Google ignores fragments
+    const url = parsed.href;
+    const body: InspectUrlIndexRequest = { siteUrl: site, inspectionUrl: url, languageCode: languageCode ?? 'en-US' };
     return this.call({
       tool: 'urlInspection.index.inspect',
       bucket: 'urlInspection',
@@ -199,7 +341,9 @@ export class GscService {
       params: body,
       ttlMs: TTL.inspection,
       bypassCache,
-      run: () => this.api.inspectUrl(body),
+      signal: opts.signal,
+      deadline: opts.deadline,
+      run: (o) => this.api.inspectUrl(body, o),
     });
   }
 
@@ -207,7 +351,7 @@ export class GscService {
   quotaStatus(siteUrls: string[]) {
     const now = Date.now();
     const sites = siteUrls.map((raw) => {
-      const site = normalizeSiteUrl(raw);
+      const site = normalizeKnownSiteUrl(raw);
       const inspection = limitsFor('urlInspection', site, this.opts.safetyFactor);
       const analytics = limitsFor('searchAnalytics', site, this.opts.safetyFactor);
       const daily = inspection.daily[0]!;
@@ -221,7 +365,7 @@ export class GscService {
         urlInspectionToday: { used, limit: daily.limit, remaining: Math.max(0, daily.limit - used) },
         urlInspectionThisMinute: window(inspection),
         searchAnalyticsThisMinute: window(analytics),
-        searchAnalyticsCooldownSeconds: Math.ceil(this.breaker.remaining(`searchAnalytics:${site}`, now) / 1000),
+        searchAnalyticsCooldownSeconds: Math.ceil((this.breaker.check(`searchAnalytics:${site}`, now)?.remainingMs ?? 0) / 1000),
       };
     });
     const other = limitsFor('other', undefined, this.opts.safetyFactor).windows.map((w) => ({
@@ -240,4 +384,12 @@ export class GscService {
   flush(): Promise<void> {
     return this.limiter.daily.flush();
   }
+}
+
+/** The signal for one Google request: aborts on client disconnect or at the deadline. */
+function requestSignal(signal: AbortSignal | undefined, deadline: number | undefined): AbortSignal | undefined {
+  const parts = [signal, deadline === undefined ? undefined : AbortSignal.timeout(Math.max(1, deadline - Date.now()))].filter(
+    (x): x is AbortSignal => x !== undefined,
+  );
+  return parts.length > 1 ? AbortSignal.any(parts) : parts[0];
 }

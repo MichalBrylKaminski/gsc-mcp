@@ -4,7 +4,7 @@ A read-only [MCP](https://modelcontextprotocol.io) server for the **Google Searc
 
 - Covers every read method of the Search Console API: sites, sitemaps, Search Analytics and URL Inspection.
 - Read-only by design. It requests only the `webmasters.readonly` OAuth scope, so Google rejects writes even if the server attempted one.
-- Paces requests to stay inside Google's published quotas. It caches results, retries transient errors with backoff, and backs off for 15 minutes after a Search Analytics load-quota error.
+- Paces requests to stay inside Google's published quotas. It caches results, retries transient errors with backoff, and pauses a property's Search Analytics for 15 minutes after a quota error.
 
 ## Tools
 
@@ -32,9 +32,9 @@ Google's published limits ([source](https://developers.google.com/webmaster-tool
 | URL Inspection | 600 QPM and **2,000 QPD** per site | 480/min, 1,600/day |
 | Sites, sitemaps | 20 QPS and 200 QPM per user | 16/s, 160/min |
 
-- **Waiting:** if a per-minute window is full, the call waits up to `MAX_QUEUE_WAIT_MS` for a free slot. After that it fails with `LOCAL_RATE_LIMIT` and `retryAfterSeconds`.
+- **Waiting:** if a per-minute window or every concurrency slot is full, the call waits up to `MAX_QUEUE_WAIT_MS` in total for a free slot. After that it fails with `LOCAL_RATE_LIMIT` and `retryAfterSeconds`.
 - **Daily counters:** these reset at midnight Pacific Time, like Google's. They are saved in `/data`, so a restart doesn't reset them.
-- **Load quota:** Search Analytics also has a load quota with no published numbers. Grouping by query and/or page, and long date ranges, use the most of it. When Google reports it exceeded, the server stops querying that property for 15 minutes, as Google recommends.
+- **Load quota:** Search Analytics also has a load quota with no published numbers. Grouping by query and/or page, and long date ranges, use the most of it. Google returns the same error for every exceeded quota, and the server's own pacing already keeps under the per-minute limits, so any Search Analytics quota error is treated as load quota: no retries, and that property's queries pause for 15 minutes, as Google recommends. A daily-quota error pauses them until midnight Pacific.
 - **Caching:** results are cached to avoid repeating the same queries. Lifetimes:
   - final analytics data: 6 h;
   - fresh analytics data: 5 min;
@@ -84,7 +84,7 @@ gsc-mcp.example.com {
 }
 ```
 
-With nginx, set `proxy_buffering off;` and `proxy_read_timeout 300s;` for the `/mcp` location. A 25-URL batch inspection can take a while.
+With nginx, set `proxy_buffering off;`, `proxy_read_timeout 300s;` and `proxy_set_header Host $host;` for the `/mcp` location (the last one matters if you use `ALLOWED_HOSTS`). A 25-URL batch inspection can take a while; it stops itself after 4 minutes.
 
 ### 4. Connect the Grok bot
 
@@ -138,5 +138,7 @@ src/
 | `NOT_FOUND` | Wrong `siteUrl`. URL-prefix properties need the exact URL with a trailing slash; domain properties are `sc-domain:example.com`. Call `list_sites`. |
 | `AUTH_ERROR` | The key is invalid, deleted or disabled, or the Search Console API isn't enabled in the key's project. |
 | `LOCAL_RATE_LIMIT` | The server is pacing calls. Retry after `retryAfterSeconds`. |
-| `LOAD_QUOTA_COOLDOWN` | Google's Search Analytics load quota was exceeded. Wait, or use shorter ranges and fewer query/page dimensions. |
+| `LOAD_QUOTA_COOLDOWN` | Google reported a Search Analytics quota as exceeded (most likely the load quota). Wait 15 minutes, or use shorter ranges and fewer query/page dimensions. |
+| `GOOGLE_QUOTA_EXCEEDED` | Google reported a daily quota as used up. It resets at `resetAt` (midnight Pacific). |
+| `CANCELLED` | The client disconnected, so the server stopped the work. |
 | `DAILY_QUOTA_EXHAUSTED` | The property's URL inspections for today are used up. They reset at `resetAt` (midnight Pacific). |

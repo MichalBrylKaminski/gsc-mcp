@@ -23,6 +23,21 @@ describe('classifyGoogleError', () => {
     expect(toToolError(err).code).toBe('AUTH_ERROR');
   });
 
+  it('treats "per day" quota errors as daily, whatever the reason code', () => {
+    expect(classifyGoogleError(googleError(429, 'rateLimitExceeded', "Quota exceeded for quota metric 'Queries' per day")).kind).toBe('dailyQuota');
+    const withDetails = googleError(429, 'RESOURCE_EXHAUSTED', 'Quota exceeded');
+    (withDetails.response.data.error as Record<string, unknown>).details = [{ metadata: { quota_limit: 'UrlInspectionPerDayPerSite' } }];
+    expect(classifyGoogleError(withDetails).kind).toBe('dailyQuota');
+    expect(toToolError(withDetails).details.resetAt).toMatch(/T0[78]:00:00.000Z$/);
+  });
+
+  it('classifies network errors without a response as retryable', () => {
+    const err = Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' });
+    expect(classifyGoogleError(err).kind).toBe('network');
+    expect(classifyGoogleError(Object.assign(new Error('x'), { code: 'ERR_STREAM_PREMATURE_CLOSE' })).kind).toBe('network');
+    expect(classifyGoogleError(new Error('boom')).kind).toBe('other');
+  });
+
   it('reads Retry-After', () => {
     expect(classifyGoogleError(googleError(429, 'rateLimitExceeded', 'x', { 'retry-after': '7' })).retryAfterMs).toBe(7000);
   });
@@ -55,11 +70,12 @@ describe('withRetry', () => {
 });
 
 describe('CircuitBreaker', () => {
-  it('stays open for the cooldown', () => {
+  it('stays open for the cooldown and keeps the longer of two trips', () => {
     const b = new CircuitBreaker();
-    b.trip('k', 1000, 0);
-    expect(b.remaining('k', 500)).toBe(500);
-    expect(b.remaining('k', 1000)).toBe(0);
+    b.trip('k', 1000, 'loadQuota', 0);
+    b.trip('k', 100, 'rateLimit', 0);
+    expect(b.check('k', 500)).toEqual({ remainingMs: 500, reason: 'loadQuota' });
+    expect(b.check('k', 1000)).toBeUndefined();
   });
 });
 
@@ -72,5 +88,12 @@ describe('toToolError', () => {
     expect(e.code).toBe('PERMISSION_DENIED');
     expect(e.message).toContain('bot@p.iam.gserviceaccount.com');
     expect(e.message).toContain('sc-domain:a.com');
+  });
+});
+
+describe('withRetry network errors', () => {
+  it('retries a dropped connection', async () => {
+    const fn = vi.fn().mockRejectedValueOnce(Object.assign(new Error('socket hang up'), { code: 'ECONNRESET' })).mockResolvedValue('ok');
+    await expect(withRetry(fn, fast)).resolves.toBe('ok');
   });
 });

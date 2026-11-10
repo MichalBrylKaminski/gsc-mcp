@@ -13,14 +13,19 @@ export type ApiDataRow = searchconsole_v1.Schema$ApiDataRow;
 export type InspectUrlIndexRequest = searchconsole_v1.Schema$InspectUrlIndexRequest;
 export type UrlInspectionResult = searchconsole_v1.Schema$UrlInspectionResult;
 
+/** Per-request options; `signal` aborts the HTTP request to Google. */
+export interface RequestOptions {
+  signal?: AbortSignal;
+}
+
 /** The read-only slice of the Search Console API that this server uses. */
 export interface GscApi {
-  listSites(): Promise<WmxSite[]>;
-  getSite(siteUrl: string): Promise<WmxSite>;
-  listSitemaps(siteUrl: string, sitemapIndex?: string): Promise<WmxSitemap[]>;
-  getSitemap(siteUrl: string, feedpath: string): Promise<WmxSitemap>;
-  querySearchAnalytics(siteUrl: string, body: SearchAnalyticsQueryRequest): Promise<SearchAnalyticsQueryResponse>;
-  inspectUrl(body: InspectUrlIndexRequest): Promise<UrlInspectionResult>;
+  listSites(opts?: RequestOptions): Promise<WmxSite[]>;
+  getSite(siteUrl: string, opts?: RequestOptions): Promise<WmxSite>;
+  listSitemaps(siteUrl: string, sitemapIndex?: string, opts?: RequestOptions): Promise<WmxSitemap[]>;
+  getSitemap(siteUrl: string, feedpath: string, opts?: RequestOptions): Promise<WmxSitemap>;
+  querySearchAnalytics(siteUrl: string, body: SearchAnalyticsQueryRequest, opts?: RequestOptions): Promise<SearchAnalyticsQueryResponse>;
+  inspectUrl(body: InspectUrlIndexRequest, opts?: RequestOptions): Promise<UrlInspectionResult>;
 }
 
 export interface ServiceAccountKey {
@@ -46,23 +51,23 @@ export function createGscApi(key: ServiceAccountKey): GscApi {
   const auth = new JWT({ email: key.client_email, key: key.private_key, scopes: [GSC_READONLY_SCOPE] });
   const sc = searchconsole({ version: 'v1', auth, timeout: 60_000, retry: false });
   return {
-    async listSites() {
-      return (await sc.sites.list()).data.siteEntry ?? [];
+    async listSites(opts = {}) {
+      return (await sc.sites.list({}, { signal: opts.signal })).data.siteEntry ?? [];
     },
-    async getSite(siteUrl) {
-      return (await sc.sites.get({ siteUrl })).data;
+    async getSite(siteUrl, opts = {}) {
+      return (await sc.sites.get({ siteUrl }, { signal: opts.signal })).data;
     },
-    async listSitemaps(siteUrl, sitemapIndex) {
-      return (await sc.sitemaps.list({ siteUrl, sitemapIndex })).data.sitemap ?? [];
+    async listSitemaps(siteUrl, sitemapIndex, opts = {}) {
+      return (await sc.sitemaps.list({ siteUrl, sitemapIndex }, { signal: opts.signal })).data.sitemap ?? [];
     },
-    async getSitemap(siteUrl, feedpath) {
-      return (await sc.sitemaps.get({ siteUrl, feedpath })).data;
+    async getSitemap(siteUrl, feedpath, opts = {}) {
+      return (await sc.sitemaps.get({ siteUrl, feedpath }, { signal: opts.signal })).data;
     },
-    async querySearchAnalytics(siteUrl, requestBody) {
-      return (await sc.searchanalytics.query({ siteUrl, requestBody })).data;
+    async querySearchAnalytics(siteUrl, requestBody, opts = {}) {
+      return (await sc.searchanalytics.query({ siteUrl, requestBody }, { signal: opts.signal })).data;
     },
-    async inspectUrl(requestBody) {
-      return (await sc.urlInspection.index.inspect({ requestBody })).data.inspectionResult ?? {};
+    async inspectUrl(requestBody, opts = {}) {
+      return (await sc.urlInspection.index.inspect({ requestBody }, { signal: opts.signal })).data.inspectionResult ?? {};
     },
   };
 }

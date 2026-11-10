@@ -6,9 +6,13 @@ import type { GscService } from '../google/service.js';
 import { bypassCacheSchema, handle, READ_ONLY, siteUrlSchema, type ToolDeps } from './common.js';
 
 export const MAX_BATCH_URLS = 25;
+/** Stop a batch after this many Google outage errors in a row. */
+export const MAX_CONSECUTIVE_UPSTREAM_ERRORS = 3;
+/** Stop a batch before reverse proxies and Node's request timeout give up on it. */
+export const BATCH_DEADLINE_MS = 240_000;
 
 /** Errors that mean the rest of a batch would fail too. */
-const STOP_CODES = new Set(['DAILY_QUOTA_EXHAUSTED', 'LOCAL_RATE_LIMIT', 'GOOGLE_RATE_LIMIT', 'GOOGLE_QUOTA_EXCEEDED', 'PERMISSION_DENIED', 'AUTH_ERROR', 'SITE_NOT_ALLOWED']);
+const STOP_CODES = new Set(['CANCELLED', 'DAILY_QUOTA_EXHAUSTED', 'LOCAL_RATE_LIMIT', 'GOOGLE_RATE_LIMIT', 'GOOGLE_QUOTA_EXCEEDED', 'PERMISSION_DENIED', 'AUTH_ERROR', 'SITE_NOT_ALLOWED']);
 
 export function summarizeInspection(r: UrlInspectionResult) {
   const i = r.indexStatusResult ?? {};
@@ -38,24 +42,37 @@ const languageCodeSchema = z.string().optional().describe('BCP-47 language for t
 export async function runBatchInspection(
   service: GscService,
   args: { siteUrl: string; inspectionUrls: string[]; languageCode?: string; summaryOnly?: boolean; bypassCache?: boolean },
+  { signal, deadlineMs = BATCH_DEADLINE_MS }: { signal?: AbortSignal; deadlineMs?: number } = {},
 ) {
   const siteUrl = service.site(args.siteUrl);
   const urls = [...new Set(args.inspectionUrls)];
   if (urls.length > MAX_BATCH_URLS) throw new GscToolError('INVALID_ARGUMENT', `At most ${MAX_BATCH_URLS} URLs per batch.`);
+  const deadline = Date.now() + deadlineMs;
   const results: Record<string, unknown>[] = [];
   let stopped: { code: string; message: string } | undefined;
+  let upstreamErrors = 0;
   for (const url of urls) {
+    if (!stopped && signal?.aborted) stopped = { code: 'CANCELLED', message: 'The client disconnected.' };
+    if (!stopped && Date.now() >= deadline) {
+      stopped = { code: 'LOCAL_RATE_LIMIT', message: 'Batch time limit reached; inspect the skipped URLs in another call.' };
+    }
     if (stopped) {
       results.push({ inspectionUrl: url, skipped: true });
       continue;
     }
     try {
-      const { value, cached } = await service.inspectUrl(siteUrl, url, args.languageCode, args.bypassCache);
+      // The deadline and signal also bound the wait for quota and the Google request itself.
+      const { value, cached } = await service.inspectUrl(siteUrl, url, args.languageCode, args.bypassCache, { signal, deadline });
+      upstreamErrors = 0;
       results.push({ inspectionUrl: url, cached, ...(args.summaryOnly === false ? { result: value } : summarizeInspection(value)) });
     } catch (err) {
       const e = err instanceof GscToolError ? err : new GscToolError('INTERNAL', 'Internal server error.');
       results.push({ inspectionUrl: url, error: { code: e.code, message: e.message } });
+      upstreamErrors = e.code === 'UPSTREAM_ERROR' ? upstreamErrors + 1 : 0;
       if (STOP_CODES.has(e.code)) stopped = { code: e.code, message: e.message };
+      else if (upstreamErrors >= MAX_CONSECUTIVE_UPSTREAM_ERRORS) {
+        stopped = { code: e.code, message: `Google failed ${upstreamErrors} times in a row; try the skipped URLs later.` };
+      }
     }
   }
   return {
@@ -81,8 +98,8 @@ export function registerUrlInspectionTools(server: McpServer, { service, logger 
       inputSchema: { siteUrl: siteUrlSchema, inspectionUrl: inspectionUrlSchema, languageCode: languageCodeSchema, bypassCache: bypassCacheSchema },
       annotations: READ_ONLY,
     },
-    handle(logger, async (args: { siteUrl: string; inspectionUrl: string; languageCode?: string; bypassCache?: boolean }) => {
-      const { value, cached } = await service.inspectUrl(args.siteUrl, args.inspectionUrl, args.languageCode, args.bypassCache);
+    handle(logger, async (args: { siteUrl: string; inspectionUrl: string; languageCode?: string; bypassCache?: boolean }, { signal }) => {
+      const { value, cached } = await service.inspectUrl(args.siteUrl, args.inspectionUrl, args.languageCode, args.bypassCache, { signal });
       return { inspectionUrl: args.inspectionUrl, result: value, cached };
     }),
   );
@@ -104,8 +121,8 @@ export function registerUrlInspectionTools(server: McpServer, { service, logger 
       },
       annotations: READ_ONLY,
     },
-    handle(logger, (args: { siteUrl: string; inspectionUrls: string[]; languageCode?: string; summaryOnly?: boolean; bypassCache?: boolean }) =>
-      runBatchInspection(service, args),
+    handle(logger, (args: { siteUrl: string; inspectionUrls: string[]; languageCode?: string; summaryOnly?: boolean; bypassCache?: boolean }, { signal }) =>
+      runBatchInspection(service, args, { signal }),
     ),
   );
 }

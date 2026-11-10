@@ -6,14 +6,18 @@ import { addDays, ptDay } from '../time.js';
 import { bypassCacheSchema, handle, READ_ONLY, siteUrlSchema, type ToolDeps } from './common.js';
 import { formatSitemap } from './sitemaps.js';
 
-export const MAX_OVERVIEW_DAYS = 240;
+/** Two periods plus the lag padding must fit in Search Console's ~16 months of data. */
+export const MAX_OVERVIEW_DAYS = 230;
+/** Extra days fetched so a long delay in final data doesn't cut the previous period short. */
+export const LAG_PADDING_DAYS = 14;
 
 interface Totals {
   clicks: number;
   impressions: number;
   ctr: number | null;
   position: number | null;
-  days: number;
+  /** Days with at least one impression; days without data have no row. */
+  daysWithData: number;
 }
 
 /** Sums daily rows. Position is impression-weighted, as Search Console averages it. */
@@ -31,29 +35,50 @@ export function totals(rows: ApiDataRow[]): Totals {
     impressions,
     ctr: impressions ? Number((clicks / impressions).toFixed(4)) : null,
     position: impressions ? Number((weighted / impressions).toFixed(2)) : null,
-    days: rows.length,
+    daysWithData: rows.length,
   };
 }
 
 const pct = (cur: number, prev: number) => (prev ? Number((((cur - prev) / prev) * 100).toFixed(1)) : null);
 
 /**
- * Splits daily rows into the last `days` days of available data and the
- * `days` before that. Fresh days without final data are left out, so both
- * periods cover the same number of calendar days.
+ * Final data normally lags 2-3 days. The current period never ends before
+ * this many days ago, so a site that stopped getting impressions shows the
+ * drop instead of an older window that ends on its last day with data.
  */
-export function comparePeriods(rows: ApiDataRow[], days: number) {
+export const FINAL_DATA_LAG_DAYS = 4;
+
+/**
+ * Splits daily rows into the last `days` calendar days and the `days` before
+ * that. The current period ends on the latest day with data, or
+ * `today - FINAL_DATA_LAG_DAYS` if that is later. `fetchedFrom` is the first
+ * date queried: a previous period starting before it would be silently
+ * short, so that case is flagged.
+ */
+export function comparePeriods(rows: ApiDataRow[], days: number, opts: { today: string; fetchedFrom?: string }) {
   const dated = rows.filter((r) => r.keys?.[0]).sort((a, b) => a.keys![0]!.localeCompare(b.keys![0]!));
-  const dataThrough = dated.at(-1)?.keys?.[0];
-  if (!dataThrough) return { dataThrough: null, current: null, previous: null, change: null };
-  const currentStart = addDays(dataThrough, -(days - 1));
+  const latestDataDate = dated.at(-1)?.keys?.[0] ?? null;
+  const expectedThrough = addDays(opts.today, -FINAL_DATA_LAG_DAYS);
+  const noRecentData = latestDataDate === null || latestDataDate < expectedThrough;
+  const endDate = noRecentData ? expectedThrough : latestDataDate;
+  const currentStart = addDays(endDate, -(days - 1));
   const previousStart = addDays(currentStart, -days);
-  const current = totals(dated.filter((r) => r.keys![0]! >= currentStart));
-  const previous = totals(dated.filter((r) => r.keys![0]! >= previousStart && r.keys![0]! < currentStart));
+  const inRange = (from: string, to: string) => dated.filter((r) => r.keys![0]! >= from && r.keys![0]! <= to);
+  const current = totals(inRange(currentStart, endDate));
+  const previous = totals(inRange(previousStart, addDays(currentStart, -1)));
   return {
-    dataThrough,
-    current: { startDate: currentStart, endDate: dataThrough, ...current },
+    latestDataDate,
+    noRecentData,
+    ...(noRecentData
+      ? {
+          note:
+            `No final data after ${latestDataDate ?? 'the fetched window'}; expected data through about ${expectedThrough}. ` +
+            'The site may have lost impressions, or Google is late publishing final data.',
+        }
+      : {}),
+    current: { startDate: currentStart, endDate, ...current },
     previous: { startDate: previousStart, endDate: addDays(currentStart, -1), ...previous },
+    previousPeriodComplete: opts.fetchedFrom === undefined || previousStart >= opts.fetchedFrom,
     change: {
       clicksPct: pct(current.clicks, previous.clicks),
       impressionsPct: pct(current.impressions, previous.impressions),
@@ -66,8 +91,7 @@ export function comparePeriods(rows: ApiDataRow[], days: number) {
 export async function runSiteOverview(service: GscService, args: { siteUrl: string; days?: number; type?: string; bypassCache?: boolean }) {
   const days = args.days ?? 28;
   const today = ptDay(Date.now());
-  // Extra days cover the 2-3 day lag before data is final.
-  const startDate = addDays(today, -(2 * days + 4));
+  const startDate = addDays(today, -(2 * days + LAG_PADDING_DAYS));
   const [site, sitemaps, analytics] = await Promise.all([
     service.getSite(args.siteUrl, args.bypassCache),
     service.listSitemaps(args.siteUrl, undefined, args.bypassCache),
@@ -80,7 +104,7 @@ export async function runSiteOverview(service: GscService, args: { siteUrl: stri
   const maps = sitemaps.value.map(formatSitemap);
   return {
     site: { siteUrl: site.value.siteUrl, permissionLevel: site.value.permissionLevel },
-    performance: { type: args.type ?? 'web', days, ...comparePeriods(analytics.value.rows ?? [], days) },
+    performance: { type: args.type ?? 'web', days, ...comparePeriods(analytics.value.rows ?? [], days, { today, fetchedFrom: startDate }) },
     sitemaps: {
       count: maps.length,
       withErrors: maps.filter((m) => (m.errors ?? 0) > 0).length,
@@ -99,7 +123,9 @@ export function registerOverviewTools(server: McpServer, { service, logger }: To
       title: 'Site overview',
       description:
         "One-call summary of a property: the service account's permission level, sitemap health, and total clicks, impressions, CTR and " +
-        'average position for the last N days of final data compared with the N days before. Uses one cheap date-grouped analytics query.',
+        'average position for the last N days of final data compared with the N days before. Uses one cheap date-grouped analytics query. ' +
+        'The current period ends on the latest day with final data (normally 2-3 days ago); "noRecentData" flags a site whose data stops ' +
+        'earlier, which may mean it lost its search traffic. "daysWithData" counts days that had impressions.',
       inputSchema: {
         siteUrl: siteUrlSchema,
         days: z.number().int().min(1).max(MAX_OVERVIEW_DAYS).optional().describe('Length of each period in days (default 28).'),
