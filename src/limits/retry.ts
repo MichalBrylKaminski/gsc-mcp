@@ -44,11 +44,32 @@ export async function withRetry<T>(fn: () => Promise<T>, opts: RetryOptions = {}
 /** Blocks a key (e.g. one site's Search Analytics) for a cooldown period. */
 export class CircuitBreaker {
   private entries = new Map<string, { until: number; reason: string }>();
+  /** Called after every trip, e.g. to save the state. */
+  onChange?: () => void;
 
   trip(key: string, ms: number, reason: string, now = Date.now()): void {
+    if (!Number.isFinite(ms) || ms <= 0) return; // a NaN pause would never expire
     const prev = this.entries.get(key);
     if (prev && prev.until > now + ms) return;
     this.entries.set(key, { until: now + ms, reason });
+    this.onChange?.();
+  }
+
+  /** The cooldowns still active at `now`, for saving. */
+  snapshot(now = Date.now()): Record<string, { until: number; reason: string }> {
+    return Object.fromEntries([...this.entries].filter(([, e]) => e.until > now));
+  }
+
+  /**
+   * Loads saved cooldowns, skipping expired or malformed ones and any ending
+   * more than `maxMs` from now (e.g. saved while the clock was far ahead).
+   */
+  restore(saved: unknown, maxMs: number, now = Date.now()): void {
+    if (!saved || typeof saved !== 'object') return;
+    for (const [key, e] of Object.entries(saved as Record<string, { until?: unknown; reason?: unknown }>)) {
+      if (typeof e?.until !== 'number' || typeof e.reason !== 'string') continue;
+      if (Number.isFinite(e.until) && e.until > now && e.until <= now + maxMs) this.entries.set(key, { until: e.until, reason: e.reason });
+    }
   }
 
   /** The active cooldown for `key`, or undefined if it isn't blocked. */

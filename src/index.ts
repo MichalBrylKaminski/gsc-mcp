@@ -22,6 +22,7 @@ async function main() {
     maxConcurrency: config.MAX_CONCURRENCY,
     cacheEnabled: config.CACHE_ENABLED,
     quotaStateFile: join(config.DATA_DIR, 'quota-state.json'),
+    pauseStateFile: join(config.DATA_DIR, 'pause-state.json'),
     logger,
   });
 

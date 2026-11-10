@@ -1,4 +1,9 @@
+import { mkdtempSync, writeFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, describe, expect, it, vi } from 'vitest';
+import type { SearchAnalyticsQueryRequest } from '../src/google/client.js';
+import { ptDay } from '../src/time.js';
 import { normalizeSiteUrl, urlInProperty } from '../src/google/service.js';
 import { fakeApi, googleError, makeService } from './helpers.js';
 
@@ -265,6 +270,101 @@ describe('GscService quota handling', () => {
     });
   });
 
+  describe('pause bookkeeping', () => {
+    afterEach(() => vi.useRealTimers());
+
+    it('a slow success sent before the pause does not reset the steps', async () => {
+      vi.useFakeTimers({ toFake: ['Date'] });
+      vi.setSystemTime(new Date('2026-11-08T12:00:00Z'));
+      let releaseSlow!: () => void;
+      const slow = new Promise<void>((r) => (releaseSlow = r));
+      const query = vi.fn(async (_site: string, b: SearchAnalyticsQueryRequest) => {
+        if (b.endDate === 'slow') {
+          await slow;
+          return { rows: [] };
+        }
+        throw googleError(429, 'rateLimitExceeded', 'Quota exceeded');
+      });
+      const service = makeService(fakeApi({ querySearchAnalytics: query }));
+      const pending = service.querySearchAnalytics('sc-domain:a.com', { ...body, endDate: 'slow' });
+      await vi.waitFor(() => expect(query).toHaveBeenCalledTimes(1));
+      await service.querySearchAnalytics('sc-domain:a.com', body).catch(() => {}); // pause step 0
+      releaseSlow();
+      await pending; // sent before the pause, so it proves nothing
+      vi.setSystemTime(new Date('2026-11-08T12:16:00Z'));
+      const next = await service.querySearchAnalytics('sc-domain:a.com', { ...body, endDate: '2026-10-30' }).catch((e) => e);
+      expect(next.details.retryAfterSeconds).toBe(3600);
+    });
+
+    it('keeps pauses and their steps across a restart', async () => {
+      const file = join(mkdtempSync(join(tmpdir(), 'gsc-mcp-')), 'pause-state.json');
+      const query = vi.fn().mockRejectedValue(googleError(429, 'rateLimitExceeded', 'Quota exceeded'));
+      const before = makeService(fakeApi({ querySearchAnalytics: query }), { pauseStateFile: file });
+      await before.querySearchAnalytics('sc-domain:a.com', body).catch(() => {});
+      await before.flush();
+      const after = makeService(fakeApi({ querySearchAnalytics: query }), { pauseStateFile: file });
+      await expect(after.querySearchAnalytics('sc-domain:a.com', { ...body, endDate: '2026-10-30' })).rejects.toMatchObject({ code: 'LOAD_QUOTA_COOLDOWN' });
+      expect(query).toHaveBeenCalledTimes(1);
+      expect(after.quotaStatus(['sc-domain:a.com']).sites[0]?.searchAnalyticsCooldownSeconds).toBeGreaterThan(890);
+    });
+  });
+
+  it('ignores corrupt or stale saved pauses', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'gsc-mcp-'));
+    const file = join(dir, 'pause-state.json');
+    const now = Date.now();
+    const day = ptDay(now);
+    writeFileSync(
+      file,
+      JSON.stringify({
+        breaker: {
+          'searchAnalytics:sc-domain:a.com': { until: now + 365 * 86_400_000, reason: 'quota' }, // clock was far ahead
+          'searchAnalytics:sc-domain:b.com': { until: 'soon', reason: 'quota' },
+        },
+        strikes: {
+          'searchAnalytics:sc-domain:c.com': { step: -5, day, pausedAt: now - 1000 },
+          'searchAnalytics:sc-domain:d.com': { step: 0.5, day, pausedAt: now - 1000 },
+          'searchAnalytics:sc-domain:e.com': { step: 0, day, pausedAt: now + 3_600_000 },
+        },
+      }),
+    );
+    const query = vi.fn().mockRejectedValue(googleError(429, 'rateLimitExceeded', 'Quota exceeded'));
+    // A fresh service per site, so three pauses don't also trip the account-wide pause.
+    for (const site of ['a', 'b', 'c', 'd', 'e']) {
+      const service = makeService(fakeApi({ querySearchAnalytics: query }), { pauseStateFile: file });
+      const err = await service.querySearchAnalytics(`sc-domain:${site}.com`, body).catch((e) => e);
+      expect(err.details.retryAfterSeconds, site).toBe(900); // a fresh first pause, not NaN, a year, or a step-up
+    }
+    expect(query).toHaveBeenCalledTimes(5);
+  });
+
+  it('keeps a short pause that runs past PT midnight across a restart', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    try {
+      vi.setSystemTime(new Date('2026-11-09T07:45:00Z')); // 23:45 PT
+      const file = join(mkdtempSync(join(tmpdir(), 'gsc-mcp-')), 'pause-state.json');
+      const until = Date.parse('2026-11-09T08:30:00Z'); // a 1-hour pause from 23:30 PT
+      writeFileSync(file, JSON.stringify({ breaker: { 'searchAnalytics:sc-domain:a.com': { until, reason: 'quota' } } }));
+      const service = makeService(fakeApi(), { pauseStateFile: file });
+      expect(service.quotaStatus(['sc-domain:a.com']).sites[0]?.searchAnalyticsCooldownSeconds).toBe(45 * 60);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+    it("retries for a caller that joined another caller's call which hit its own deadline", async () => {
+    const inspectUrl = vi.fn((_body: unknown, opts?: { signal?: AbortSignal }) => {
+      const signal = opts?.signal;
+      if (!signal) return Promise.resolve({ indexStatusResult: { verdict: 'PASS' } });
+      return new Promise<never>((_, reject) => signal.addEventListener('abort', () => reject(new Error('aborted'))));
+    });
+    const service = makeService(fakeApi({ inspectUrl }));
+    const owner = service.inspectUrl('sc-domain:a.com', 'https://a.com/', undefined, false, { deadline: Date.now() + 30 });
+    const joiner = service.inspectUrl('sc-domain:a.com', 'https://a.com/');
+    await expect(owner).rejects.toMatchObject({ code: 'LOCAL_RATE_LIMIT', message: expect.stringContaining('Time limit') });
+    await expect(joiner).resolves.toMatchObject({ value: { indexStatusResult: { verdict: 'PASS' } } });
+  });
+
   it('cancels sites, sitemaps and analytics calls when the client disconnects', async () => {
     const controller = new AbortController();
     controller.abort();
@@ -329,6 +429,11 @@ describe('GscService quota handling', () => {
     expect(inspectUrl).toHaveBeenCalledTimes(1); // daily errors are not retried
     await expect(service.inspectUrl('sc-domain:a.com', 'https://a.com/2')).rejects.toMatchObject({ code: 'DAILY_QUOTA_EXHAUSTED' });
     expect(inspectUrl).toHaveBeenCalledTimes(1);
+    // Google's own 2,000 is recorded, but shown against the local limit.
+    expect(service.quotaStatus(['sc-domain:a.com']).sites[0]?.urlInspectionToday).toEqual({ used: 2000, limit: 2000, remaining: 0 });
+    const scaled = makeService(fakeApi({ inspectUrl }), { safetyFactor: 0.8 });
+    await scaled.inspectUrl('sc-domain:a.com', 'https://a.com/9').catch(() => {});
+    expect(scaled.quotaStatus(['sc-domain:a.com']).sites[0]?.urlInspectionToday).toEqual({ used: 1600, limit: 1600, remaining: 0 });
   });
 
   it('rejects URLs outside the property without spending quota', async () => {

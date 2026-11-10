@@ -132,9 +132,19 @@ export function classifyGoogleError(err: unknown): ClassifiedGoogleError {
 /** The client went away, so the work was abandoned. */
 export const cancelledError = () => new GscToolError('CANCELLED', 'The request was cancelled because the client disconnected.');
 
+const deadlineErrors = new WeakSet<GscToolError>();
+
 /** The caller's time budget (e.g. a batch's deadline) ran out. */
-export const deadlineError = () =>
-  new GscToolError('LOCAL_RATE_LIMIT', 'Time limit reached before Google answered; retry the remaining work in another call.', { retryAfterSeconds: 1 });
+export function deadlineError(): GscToolError {
+  const e = new GscToolError('LOCAL_RATE_LIMIT', 'Time limit reached before Google answered; retry the remaining work in another call.', {
+    retryAfterSeconds: 1,
+  });
+  deadlineErrors.add(e);
+  return e;
+}
+
+/** Whether `err` came from deadlineError(), i.e. one caller's own time budget. */
+export const isDeadlineError = (err: unknown): boolean => err instanceof GscToolError && deadlineErrors.has(err);
 
 /**
  * Google returns the same error for every exceeded quota, so a load-quota

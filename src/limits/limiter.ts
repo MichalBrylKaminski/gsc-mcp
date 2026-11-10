@@ -65,6 +65,62 @@ export function ensureWritableDir(dir: string): void {
   }
 }
 
+/**
+ * A JSON state file saved atomically (temp file, fsync, rename) with coalesced
+ * writes. Failures are logged, never thrown: in-memory state stays authoritative.
+ */
+export class JsonFile<T> {
+  private writing: Promise<void> | undefined;
+  private dirty = false;
+  private latest: (() => T) | undefined;
+
+  constructor(
+    readonly file: string | undefined,
+    private readonly label: string,
+    private readonly logger?: Logger,
+  ) {}
+
+  read(): T | undefined {
+    if (!this.file) return undefined;
+    try {
+      return JSON.parse(readFileSync(this.file, 'utf8')) as T;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') this.logger?.warn(`${this.label} unreadable, starting fresh`, { file: this.file });
+      return undefined;
+    }
+  }
+
+  /** Schedules a save of `data()`, evaluated when the write happens. */
+  save(data: () => T): void {
+    if (!this.file) return;
+    this.latest = data;
+    this.dirty = true;
+    if (this.writing) return;
+    const file = this.file;
+    this.writing = (async () => {
+      while (this.dirty) {
+        this.dirty = false;
+        const tmp = `${file}.tmp`;
+        try {
+          await mkdir(dirname(file), { recursive: true });
+          // flush: fsync before rename, so a crash can't leave an empty state file.
+          await writeFile(tmp, JSON.stringify(this.latest!()), { flush: true });
+          await rename(tmp, file);
+        } catch (err) {
+          this.logger?.error(`failed to save ${this.label}`, { file, error: (err as Error).message });
+        }
+      }
+    })().finally(() => {
+      this.writing = undefined;
+    });
+  }
+
+  /** Waits for pending writes to finish. */
+  async flush(): Promise<void> {
+    while (this.writing) await this.writing;
+  }
+}
+
 interface DailyState {
   day: string;
   counts: Record<string, number>;
@@ -76,20 +132,12 @@ interface DailyState {
  */
 export class DailyCounters {
   private state: DailyState = { day: '', counts: {} };
-  private writing: Promise<void> | undefined;
-  private dirty = false;
+  private readonly store: JsonFile<DailyState>;
 
-  constructor(
-    private readonly file: string | undefined,
-    private readonly logger?: Logger,
-  ) {
-    if (!file) return;
-    try {
-      const saved = JSON.parse(readFileSync(file, 'utf8')) as DailyState;
-      if (typeof saved.day === 'string' && saved.counts && typeof saved.counts === 'object') this.state = saved;
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') logger?.warn('quota state unreadable, starting fresh', { file });
-    }
+  constructor(file: string | undefined, logger?: Logger) {
+    this.store = new JsonFile(file, 'quota state', logger);
+    const saved = this.store.read();
+    if (saved && typeof saved.day === 'string' && saved.counts && typeof saved.counts === 'object') this.state = saved;
   }
 
   private current(now: number): DailyState {
@@ -117,31 +165,12 @@ export class DailyCounters {
   }
 
   private persist(): void {
-    if (!this.file) return;
-    this.dirty = true;
-    if (this.writing) return;
-    const file = this.file;
-    this.writing = (async () => {
-      while (this.dirty) {
-        this.dirty = false;
-        const tmp = `${file}.tmp`;
-        try {
-          await mkdir(dirname(file), { recursive: true });
-          // flush: fsync before rename, so a crash can't leave an empty state file.
-          await writeFile(tmp, JSON.stringify(this.state), { flush: true });
-          await rename(tmp, file);
-        } catch (err) {
-          this.logger?.error('failed to save quota state', { file, error: (err as Error).message });
-        }
-      }
-    })().finally(() => {
-      this.writing = undefined;
-    });
+    this.store.save(() => this.state);
   }
 
   /** Waits for pending writes to finish. */
-  async flush(): Promise<void> {
-    while (this.writing) await this.writing;
+  flush(): Promise<void> {
+    return this.store.flush();
   }
 }
 

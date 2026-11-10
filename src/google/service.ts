@@ -1,6 +1,6 @@
 import { cacheKey, ResponseCache, TTL } from '../cache.js';
-import { cancelledError, classifyGoogleError, deadlineError, GscToolError, toToolError, type ClassifiedGoogleError } from '../errors.js';
-import { DailyCounters, RateLimiter, Semaphore, SlidingWindows } from '../limits/limiter.js';
+import { cancelledError, classifyGoogleError, deadlineError, GscToolError, isDeadlineError, toToolError, type ClassifiedGoogleError } from '../errors.js';
+import { DailyCounters, JsonFile, RateLimiter, Semaphore, SlidingWindows } from '../limits/limiter.js';
 import {
   GLOBAL_PAUSE_MIN_PROPERTIES,
   GLOBAL_PAUSE_MS,
@@ -23,6 +23,8 @@ export interface GscServiceOptions {
   maxConcurrency: number;
   cacheEnabled: boolean;
   quotaStateFile?: string;
+  /** Where quota pauses are saved, so a restart doesn't resume a paused property early. */
+  pauseStateFile?: string;
   retry?: { maxRetries?: number; baseDelayMs?: number; maxDelayMs?: number };
   logger: Logger;
 }
@@ -109,6 +111,19 @@ export interface CallOptions {
 }
 
 const MAX_JOIN_ATTEMPTS = 3;
+
+interface QuotaStrike {
+  step: number;
+  /** PT day of the pause; a new day starts the steps over. */
+  day: string;
+  /** When the latest pause began. */
+  pausedAt: number;
+}
+
+interface PauseState {
+  breaker?: unknown;
+  strikes?: Record<string, QuotaStrike>;
+}
 const GLOBAL_ANALYTICS_KEY = 'searchAnalytics:*';
 
 export class GscService {
@@ -118,7 +133,8 @@ export class GscService {
   private readonly semaphore: Semaphore;
   private readonly allowed?: Set<string>;
   /** Consecutive quota pauses per property (no success in between), to spot a used-up daily quota. */
-  private readonly quotaStrikes = new Map<string, { step: number; day: string }>();
+  private readonly quotaStrikes = new Map<string, QuotaStrike>();
+  private readonly pauseStore: JsonFile<PauseState>;
   private recentAnalyticsPauses: { site: string; at: number }[] = [];
 
   constructor(
@@ -129,6 +145,19 @@ export class GscService {
     this.cache = new ResponseCache(opts.cacheEnabled);
     this.semaphore = new Semaphore(opts.maxConcurrency);
     if (opts.allowedSites?.length) this.allowed = new Set(opts.allowedSites.map(normalizeSiteUrl));
+    this.pauseStore = new JsonFile(opts.pauseStateFile, 'pause state', opts.logger);
+    const saved = this.pauseStore.read();
+    const now = Date.now();
+    // No pause outlasts the later of the next PT midnight and the longest short step (a 1-hour pause can
+    // cross midnight), so anything longer is stale or corrupt, e.g. saved while the clock was far ahead.
+    this.breaker.restore(saved?.breaker, Math.max(nextPtMidnight(now) - now, QUOTA_PAUSE_STEPS_MS.at(-1)!), now);
+    const today = ptDay(now);
+    for (const [key, st] of Object.entries(saved?.strikes && typeof saved.strikes === 'object' ? saved.strikes : {})) {
+      const valid =
+        Number.isInteger(st?.step) && st.step >= 0 && st.day === today && Number.isFinite(st.pausedAt) && st.pausedAt <= now;
+      if (valid) this.quotaStrikes.set(key, { step: Math.min(st.step, QUOTA_PAUSE_STEPS_MS.length), day: st.day, pausedAt: st.pausedAt });
+    }
+    this.breaker.onChange = () => this.savePauses();
   }
 
   /** Normalizes a site URL and checks it against GSC_ALLOWED_SITES. */
@@ -150,9 +179,11 @@ export class GscService {
           log.info('tool call', { tool: spec.tool, site: spec.siteUrl, cached: hit, ms: Date.now() - started });
           return { value, cached: hit };
         } catch (err) {
-          // We may have joined another client's in-flight call that was then cancelled; that isn't our failure.
-          const joinedCancelled = err instanceof GscToolError && err.code === 'CANCELLED' && !spec.signal?.aborted;
-          if (!joinedCancelled || attempt >= MAX_JOIN_ATTEMPTS) throw err;
+          // We may have joined another caller's in-flight call that was then cancelled or ran out of
+          // its own time budget; that isn't our failure, so try again with our own call.
+          const othersCancel = err instanceof GscToolError && err.code === 'CANCELLED' && !spec.signal?.aborted;
+          const othersDeadline = isDeadlineError(err) && (spec.deadline === undefined || Date.now() < spec.deadline);
+          if (!(othersCancel || othersDeadline) || attempt >= MAX_JOIN_ATTEMPTS) throw err;
         }
       }
     } catch (err) {
@@ -183,11 +214,17 @@ export class GscService {
               await this.limiter.acquire(limits, { deadline: queueDeadline, signal });
               // Another call may have paused this site while we queued.
               this.checkBreaker(spec);
+              const sentAt = Date.now();
               try {
                 const value = await spec.run({ signal: requestSignal(signal, deadline) });
-                // Google is serving this property again, so the next quota error starts at the shortest pause.
+                // Google is serving this property again, so the next quota error starts at the shortest
+                // pause. A request sent before the latest pause began proves nothing about it.
                 const key = this.breakerKey(spec);
-                if (key) this.quotaStrikes.delete(key);
+                const strike = key ? this.quotaStrikes.get(key) : undefined;
+                if (key && strike && sentAt >= strike.pausedAt) {
+                  this.quotaStrikes.delete(key);
+                  this.savePauses();
+                }
                 return value;
               } catch (err) {
                 // Record quota state before the slot is released, so queued calls see it.
@@ -308,7 +345,7 @@ export class GscService {
     const today = ptDay(now);
     const prev = this.quotaStrikes.get(key);
     const step = prev && prev.day === today ? prev.step + 1 : 0;
-    this.quotaStrikes.set(key, { step, day: today });
+    this.quotaStrikes.set(key, { step, day: today, pausedAt: now });
     const untilMidnight = step >= QUOTA_PAUSE_STEPS_MS.length;
     const ms = untilMidnight ? nextPtMidnight(now) - now : QUOTA_PAUSE_STEPS_MS[step]!;
     this.breaker.trip(key, ms, untilMidnight ? 'dailyQuota' : 'quota', now);
@@ -444,7 +481,8 @@ export class GscService {
       };
       return {
         siteUrl: site,
-        urlInspectionToday: { used, limit: daily.limit, remaining: Math.max(0, daily.limit - used) },
+        // Google reporting the day as used up fills the counter past the local limit; show it as full.
+        urlInspectionToday: { used: Math.min(used, daily.limit), limit: daily.limit, remaining: Math.max(0, daily.limit - used) },
         urlInspectionThisMinute: window(inspection),
         searchAnalyticsThisMinute: window(analytics),
         searchAnalyticsCooldownSeconds: Math.ceil((this.openPause({ bucket: 'searchAnalytics', siteUrl: site }, now)?.remainingMs ?? 0) / 1000),
@@ -464,8 +502,12 @@ export class GscService {
     };
   }
 
-  flush(): Promise<void> {
-    return this.limiter.daily.flush();
+  private savePauses(): void {
+    this.pauseStore.save(() => ({ breaker: this.breaker.snapshot(), strikes: Object.fromEntries(this.quotaStrikes) }));
+  }
+
+  async flush(): Promise<void> {
+    await Promise.all([this.limiter.daily.flush(), this.pauseStore.flush()]);
   }
 }
 
