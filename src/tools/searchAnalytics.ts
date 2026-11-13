@@ -14,12 +14,12 @@ const DIMENSIONS = ['date', 'hour', 'query', 'page', 'country', 'device', 'searc
 const FILTER_DIMENSIONS = ['country', 'device', 'page', 'query', 'searchAppearance'] as const;
 const OPERATORS = ['equals', 'notEquals', 'contains', 'notContains', 'includingRegex', 'excludingRegex'] as const;
 const TYPES = ['web', 'image', 'video', 'news', 'discover', 'googleNews'] as const;
-const date = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Use YYYY-MM-DD');
+export const dateSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/, 'Use YYYY-MM-DD');
 
 export const searchAnalyticsInput = {
   siteUrl: siteUrlSchema,
-  startDate: date.describe('First day, inclusive, YYYY-MM-DD in Pacific Time. Data goes back about 16 months.'),
-  endDate: date.describe('Last day, inclusive, YYYY-MM-DD in Pacific Time.'),
+  startDate: dateSchema.describe('First day, inclusive, YYYY-MM-DD in Pacific Time. Data goes back about 16 months.'),
+  endDate: dateSchema.describe('Last day, inclusive, YYYY-MM-DD in Pacific Time.'),
   dimensions: z
     .array(z.enum(DIMENSIONS))
     .optional()

@@ -45,6 +45,7 @@ describe('HTTP transport', () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual([
       'batch_inspect_urls',
+      'compare_periods',
       'get_quota_status',
       'get_site',
       'get_site_overview',

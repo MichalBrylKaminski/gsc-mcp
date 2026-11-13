@@ -18,6 +18,7 @@ A read-only [MCP](https://modelcontextprotocol.io) server for the **Google Searc
 | `inspect_url` | urlInspection.index.inspect | Google's indexed view of one URL |
 | `batch_inspect_urls` | urlInspection.index.inspect | Up to 25 URLs, with a compact summary of each. Stops after 90 seconds and marks the rest as skipped |
 | `get_site_overview` | (composite) | Permission level, sitemap health, and totals for the last N days vs. the N days before. A failing part is reported in its own section |
+| `compare_periods` | searchanalytics.query | Totals for two date ranges with the change, and optionally rows matched by query, page, country, device or search appearance, sorted by the biggest movers, gains or losses. The baseline defaults to the same number of days just before the current period |
 | `get_quota_status` | (local) | Inspections left today per property, per-minute usage, cooldowns, reset time |
 
 Left out on purpose: the write methods (`sites.add/delete`, `sitemaps.submit/delete`) and the Mobile-Friendly Test, which Google retired in December 2023.

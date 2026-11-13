@@ -42,6 +42,18 @@ export function totals(rows: ApiDataRow[]): Totals {
 
 const pct = (cur: number, prev: number) => (prev ? Number((((cur - prev) / prev) * 100).toFixed(1)) : null);
 
+type PeriodMetrics = Pick<Totals, 'clicks' | 'impressions' | 'ctr' | 'position'>;
+
+/** Relative change of the current period against the previous one. A negative position change is an improvement. */
+export function periodChange(current: PeriodMetrics, previous: PeriodMetrics) {
+  return {
+    clicksPct: pct(current.clicks, previous.clicks),
+    impressionsPct: pct(current.impressions, previous.impressions),
+    ctrPoints: current.ctr != null && previous.ctr != null ? Number(((current.ctr - previous.ctr) * 100).toFixed(2)) : null,
+    position: current.position != null && previous.position != null ? Number((current.position - previous.position).toFixed(2)) : null,
+  };
+}
+
 /**
  * Final data normally lags 2-3 days. The current period never ends before
  * this many days ago, so a site that stopped getting impressions shows the
@@ -80,12 +92,7 @@ export function comparePeriods(rows: ApiDataRow[], days: number, opts: { today: 
     current: { startDate: currentStart, endDate, ...current },
     previous: { startDate: previousStart, endDate: addDays(currentStart, -1), ...previous },
     previousPeriodComplete: opts.fetchedFrom === undefined || previousStart >= opts.fetchedFrom,
-    change: {
-      clicksPct: pct(current.clicks, previous.clicks),
-      impressionsPct: pct(current.impressions, previous.impressions),
-      ctrPoints: current.ctr != null && previous.ctr != null ? Number(((current.ctr - previous.ctr) * 100).toFixed(2)) : null,
-      position: current.position != null && previous.position != null ? Number((current.position - previous.position).toFixed(2)) : null,
-    },
+    change: periodChange(current, previous),
   };
 }
 
