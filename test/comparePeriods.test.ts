@@ -117,6 +117,22 @@ describe('sortMerged', () => {
   it('sorts by current clicks', () => {
     expect(order('clicks')).toEqual(['unknown', 'flat', 'up', 'down']);
   });
+
+  it('breaks ties by the size of the impressions change', () => {
+    const noClicks = mergePeriods(
+      1,
+      {
+        rows: [
+          ['small', 0, 2, 0, 50],
+          ['large', 0, 30, 0, 80],
+          ['drop', 0, 1, 0, 40],
+        ],
+        complete: true,
+      },
+      { rows: [['drop', 0, 12, 0, 30]], complete: true },
+    );
+    expect(sortMerged(noClicks, 'clicksChange').map((r) => r.keys[0])).toEqual(['large', 'drop', 'small']);
+  });
 });
 
 /** Fake API: totals per period, plus query rows per period. */

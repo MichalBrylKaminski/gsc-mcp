@@ -202,7 +202,10 @@ export function sortMerged(rows: MergedRow[], sortBy: SortOrder): MergedRow[] {
       if (sb == null) return -1;
       return sb - sa;
     }
-    return (b.cur.clicks ?? 0) - (a.cur.clicks ?? 0) || (b.prev.clicks ?? 0) - (a.prev.clicks ?? 0);
+    // Ties are common on low-traffic sites where every row has 0 clicks: the impressions change still shows what moved.
+    const ia = a.impressionsChange == null ? -1 : Math.abs(a.impressionsChange);
+    const ib = b.impressionsChange == null ? -1 : Math.abs(b.impressionsChange);
+    return ib - ia || (b.cur.clicks ?? 0) - (a.cur.clicks ?? 0) || (b.prev.clicks ?? 0) - (a.prev.clicks ?? 0);
   });
 }
 
