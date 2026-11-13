@@ -253,3 +253,7 @@ src/
 | `GOOGLE_QUOTA_EXCEEDED` | Google reported a quota as used up. URL Inspection pauses for 15 minutes, then 1 hour, then until `resetAt` (midnight Pacific) if it keeps happening. |
 | `CANCELLED` | The client disconnected, so the server stopped the work. |
 | `DAILY_QUOTA_EXHAUSTED` | The property's URL inspections for today are used up. They reset at `resetAt` (midnight Pacific). |
+
+## License
+
+[MIT](LICENSE)

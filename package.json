@@ -2,6 +2,7 @@
   "name": "gsc-mcp",
   "version": "0.1.0",
   "description": "Read-only Google Search Console MCP server (Streamable HTTP)",
+  "license": "MIT",
   "type": "module",
   "private": true,
   "engines": {
