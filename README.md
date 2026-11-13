@@ -115,10 +115,22 @@ dokku git:sync --build gsc-mcp https://github.com/MichalBrylKaminski/gsc-mcp.git
 
 To update, push to GitHub and run the last command again. Read the token with `dokku config:get gsc-mcp MCP_AUTH_TOKEN`. If the server isn't public, terminate TLS in front of nginx, for example with Cloudflare.
 
-### 4. Connect the Grok bot
+### 4. Connect a client
+
+Every client needs the same two things:
 
 - MCP endpoint: `https://gsc-mcp.example.com/mcp`, or your `MCP_PATH` (Streamable HTTP, stateless, POST only).
 - Auth header: `Authorization: Bearer <MCP_AUTH_TOKEN>`.
+
+The examples below read the token from an environment variable, `GSC_MCP_TOKEN`, so it doesn't end up in a config file you might share. Set it in your shell profile:
+
+```bash
+export GSC_MCP_TOKEN='<MCP_AUTH_TOKEN>'
+```
+
+After connecting, ask something like "list my Search Console sites" to check that the tools work.
+
+#### Grok (xAI API)
 
 In xAI's API, add it as a remote MCP tool. Check [xAI's Remote MCP docs](https://docs.x.ai/) for the exact field names. With the Python SDK it looks roughly like this:
 
@@ -133,6 +145,74 @@ chat = client.chat.create(
 )
 chat.append(...)  # e.g. "List my sites and show last week's top 10 queries for each"
 ```
+
+#### Claude Code
+
+Add the server for all your projects (`--scope user`):
+
+```bash
+claude mcp add --transport http --scope user gsc https://gsc-mcp.example.com/mcp \
+  --header "Authorization: Bearer $GSC_MCP_TOKEN"
+claude mcp list          # gsc should show as connected
+```
+
+The shell expands `$GSC_MCP_TOKEN` when you run the command, so the token is saved in plain text in `~/.claude.json`.
+
+To share the server with a project's team instead, commit a `.mcp.json` at the repo root. Claude Code expands `${GSC_MCP_TOKEN}` when it starts, so each person keeps the token in their own environment:
+
+```json
+{
+  "mcpServers": {
+    "gsc": {
+      "type": "http",
+      "url": "https://gsc-mcp.example.com/mcp",
+      "headers": { "Authorization": "Bearer ${GSC_MCP_TOKEN}" }
+    }
+  }
+}
+```
+
+Inside a session, `/mcp` shows the server's status and its tools.
+
+#### Claude Desktop
+
+Claude Desktop's custom connectors (Settings → Connectors) support only OAuth, not a fixed bearer token. Instead, connect through the [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) bridge, which needs Node.js. Open Settings → Developer → Edit Config and add this to `claude_desktop_config.json`:
+
+```json
+{
+  "mcpServers": {
+    "gsc": {
+      "command": "npx",
+      "args": [
+        "-y", "mcp-remote", "https://gsc-mcp.example.com/mcp",
+        "--header", "Authorization:${GSC_AUTH_HEADER}"
+      ],
+      "env": { "GSC_AUTH_HEADER": "Bearer <MCP_AUTH_TOKEN>" }
+    }
+  }
+}
+```
+
+Keep `Authorization:${GSC_AUTH_HEADER}` without a space. `mcp-remote` substitutes the value from `env`, and this form avoids a known problem with spaces in arguments. Restart Claude Desktop afterwards.
+
+#### Codex
+
+Codex CLI connects to Streamable HTTP servers natively and reads the token from an environment variable:
+
+```bash
+codex mcp add gsc --url https://gsc-mcp.example.com/mcp --bearer-token-env-var GSC_MCP_TOKEN
+codex mcp list
+```
+
+Or add the same thing to `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.gsc]
+url = "https://gsc-mcp.example.com/mcp"
+bearer_token_env_var = "GSC_MCP_TOKEN"
+```
+
+`GSC_MCP_TOKEN` must be set in the environment Codex starts from. In the Codex TUI, `/mcp` lists the connected servers and their tools.
 
 ## Development
 
