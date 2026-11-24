@@ -116,15 +116,16 @@ const OAUTH_VARIABLES = ['MCP_PUBLIC_URL', 'GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAU
 
 /** An origin the SDK accepts as an OAuth issuer: https, or http on localhost; no path, query or fragment. */
 function parsePublicUrl(raw: string): URL | string {
+  const text = raw.trim();
   let url: URL;
   try {
-    url = new URL(raw.trim());
+    url = new URL(text);
   } catch {
     return 'must be a URL such as https://gsc-mcp.example.com';
   }
   const local = url.hostname === 'localhost' || url.hostname === '127.0.0.1';
   if (url.protocol !== 'https:' && !(local && url.protocol === 'http:')) return 'must use https (http is allowed only for localhost)';
-  if (url.pathname !== '/' || url.search || url.hash || raw.trim().endsWith('?') || raw.trim().endsWith('#')) {
+  if (url.pathname !== '/' || url.search || url.hash || text.endsWith('?') || text.endsWith('#')) {
     return 'must be the bare origin, such as https://gsc-mcp.example.com (no path, query or fragment)';
   }
   if (url.username || url.password) return 'must not contain a user name or password';
@@ -149,7 +150,12 @@ const ConfigSchema = z.object({
   GOOGLE_OAUTH_CLIENT_SECRET: z.string().optional(),
   MCP_OAUTH_ALLOWED_EMAILS: csv,
   // Number of reverse proxies in front of the app (Express "trust proxy"), so rate limits see real client IPs.
-  TRUST_PROXY: z.coerce.number().int().min(0).max(10).optional(),
+  TRUST_PROXY: z
+    .string()
+    .optional()
+    .transform((v) => (v === undefined || v.trim() === '' ? undefined : v.trim()))
+    .refine((v) => v === undefined || (/^\d+$/.test(v) && Number(v) <= 10), 'TRUST_PROXY must be a whole number of proxies from 0 to 10')
+    .transform((v) => (v === undefined ? undefined : Number(v))),
   GOOGLE_APPLICATION_CREDENTIALS: z.string().min(1),
   HOST: z.string().default('0.0.0.0'),
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),

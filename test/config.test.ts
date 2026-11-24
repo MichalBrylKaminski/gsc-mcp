@@ -123,14 +123,16 @@ describe('OAuth settings', () => {
   });
 
   it('rejects a partial set', () => {
-    expect(() => loadConfig({ ...base, MCP_PUBLIC_URL: oauthEnv.MCP_PUBLIC_URL })).toThrow(/GOOGLE_OAUTH_CLIENT_ID/);
-    expect(() => loadConfig({ ...base, ...oauthEnv, MCP_OAUTH_ALLOWED_EMAILS: ' , ' })).toThrow(/MCP_OAUTH_ALLOWED_EMAILS/);
+    expect(() => loadConfig({ ...base, MCP_PUBLIC_URL: oauthEnv.MCP_PUBLIC_URL })).toThrow(/^\s+GOOGLE_OAUTH_CLIENT_ID: /m);
+    expect(() => loadConfig({ ...base, MCP_PUBLIC_URL: oauthEnv.MCP_PUBLIC_URL })).not.toThrow(/^\s+MCP_PUBLIC_URL: /m);
+    expect(() => loadConfig({ ...base, ...oauthEnv, MCP_OAUTH_ALLOWED_EMAILS: ' , ' })).toThrow(/^\s+MCP_OAUTH_ALLOWED_EMAILS: /m);
   });
 
   it('rejects a public URL with a path, query or http on a public host', () => {
-    for (const bad of ['https://x.dev/gsc', 'https://x.dev/?a=1', 'https://x.dev/#a', 'http://x.dev', 'not a url']) {
-      expect(() => loadConfig({ ...base, ...oauthEnv, MCP_PUBLIC_URL: bad }), bad).toThrow(/MCP_PUBLIC_URL/);
+    for (const bad of ['https://x.dev/gsc', 'https://x.dev/?a=1', 'https://x.dev/#a', 'https://x.dev?', 'https://u:p@x.dev', 'http://x.dev', 'not a url']) {
+      expect(() => loadConfig({ ...base, ...oauthEnv, MCP_PUBLIC_URL: bad }), bad).toThrow(/^\s+MCP_PUBLIC_URL: /m);
     }
+    expect(loadConfig({ ...base, ...oauthEnv, MCP_PUBLIC_URL: 'https://saturn.brylex-it.dev' }).oauth?.publicUrl.href).toBe('https://saturn.brylex-it.dev/');
     expect(loadConfig({ ...base, ...oauthEnv, MCP_PUBLIC_URL: 'http://localhost:3000' }).oauth?.publicUrl.href).toBe('http://localhost:3000/');
     expect(loadConfig({ ...base, ...oauthEnv, MCP_PUBLIC_URL: 'http://127.0.0.1:3000' }).oauth?.publicUrl.href).toBe('http://127.0.0.1:3000/');
   });
@@ -143,7 +145,11 @@ describe('OAuth settings', () => {
 
   it('parses TRUST_PROXY', () => {
     expect(loadConfig(base).TRUST_PROXY).toBeUndefined();
+    expect(loadConfig({ ...base, TRUST_PROXY: '' }).TRUST_PROXY).toBeUndefined();
+    expect(loadConfig({ ...base, TRUST_PROXY: ' ' }).TRUST_PROXY).toBeUndefined();
     expect(loadConfig({ ...base, TRUST_PROXY: '2' }).TRUST_PROXY).toBe(2);
+    expect(loadConfig({ ...base, TRUST_PROXY: '0' }).TRUST_PROXY).toBe(0);
+    expect(() => loadConfig({ ...base, TRUST_PROXY: '1e1' })).toThrow(/TRUST_PROXY/);
     expect(() => loadConfig({ ...base, TRUST_PROXY: 'x' })).toThrow(/TRUST_PROXY/);
     expect(() => loadConfig({ ...base, TRUST_PROXY: '11' })).toThrow(/TRUST_PROXY/);
   });
