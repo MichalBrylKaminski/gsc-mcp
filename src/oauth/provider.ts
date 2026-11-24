@@ -27,6 +27,8 @@ type Pending =
 
 interface Consent {
   csrf: string;
+  /** The end date shown on the consent page, which the grant gets. */
+  expiresOn: string;
   clientId: string;
   clientName: string;
   params: AuthorizationParams;
@@ -39,6 +41,7 @@ interface Code {
   clientId: string;
   clientName: string;
   email: string;
+  expiresOn: string;
   redirectUri: string;
   challenge: string;
   expiresAt: number;
@@ -160,7 +163,7 @@ export class GscOAuthProvider implements OAuthServerProvider {
     if (!client) return { kind: 'error', status: 400, message: 'This client is no longer registered. Start the connection again from your client.' };
     this.sweep(this.consents);
     const consentId = random();
-    const consent: Consent = { csrf: random(), clientId: client.client_id, clientName: cleanClientName(client.client_name), params: p.params, email, expiresAt: Date.now() + PENDING_TTL_MS };
+    const consent: Consent = { csrf: random(), expiresOn: expiryDayFor(this.o.ttlDays), clientId: client.client_id, clientName: cleanClientName(client.client_name), params: p.params, email, expiresAt: Date.now() + PENDING_TTL_MS };
     this.consents.set(consentId, consent);
     return {
       kind: 'consent',
@@ -168,7 +171,7 @@ export class GscOAuthProvider implements OAuthServerProvider {
       csrf: consent.csrf,
       clientName: consent.clientName,
       redirectHost: new URL(p.params.redirectUri).host,
-      expiresOn: expiryDayFor(this.o.ttlDays),
+      expiresOn: consent.expiresOn,
     };
   }
 
@@ -193,7 +196,7 @@ export class GscOAuthProvider implements OAuthServerProvider {
       return { kind: 'error', status: 400, message: 'Too many sign-ins are in progress; try again in a few minutes.' };
     }
     const code = random();
-    this.codes.set(code, { clientId: c.clientId, clientName: c.clientName, email: c.email, redirectUri, challenge: codeChallenge, expiresAt: Date.now() + PENDING_TTL_MS });
+    this.codes.set(code, { clientId: c.clientId, clientName: c.clientName, email: c.email, expiresOn: c.expiresOn, redirectUri, challenge: codeChallenge, expiresAt: Date.now() + PENDING_TTL_MS });
     this.o.logger.info('client approved', { client: c.clientName, redirectHost: new URL(redirectUri).host });
     return { kind: 'redirect', url: redirectWith(redirectUri, { code, state }) };
   }
@@ -209,7 +212,7 @@ export class GscOAuthProvider implements OAuthServerProvider {
     if (!c || c.clientId !== client.client_id) throw new InvalidGrantError('Invalid or expired authorization code.');
     if (redirectUri !== undefined && redirectUri !== c.redirectUri) throw new InvalidGrantError('redirect_uri does not match the authorization request.');
     if (!this.o.store.getClient(c.clientId)) throw new InvalidGrantError('This client is no longer registered.');
-    const grant = this.o.store.createGrant({ clientId: c.clientId, clientName: c.clientName, email: c.email, redirectHost: new URL(c.redirectUri).host });
+    const grant = this.o.store.createGrant({ clientId: c.clientId, clientName: c.clientName, email: c.email, redirectHost: new URL(c.redirectUri).host, expiresOn: c.expiresOn });
     this.o.logger.info('client connected', { client: `oauth:${grant.clientName}#${grant.id.slice(0, 6)}`, redirectHost: grant.redirectHost, expiresAt: grant.expiresAt });
     return this.o.store.issueTokens(grant.id);
   }

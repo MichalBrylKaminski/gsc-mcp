@@ -211,8 +211,11 @@ export class OAuthStore {
     return client;
   }
 
-  /** Records the owner's approval. The grant has no tokens until issueTokens. */
-  createGrant(g: { clientId: string; clientName: string; email: string; redirectHost: string }): GrantView {
+  /**
+   * Records the owner's approval. The grant has no tokens until issueTokens.
+   * `expiresOn` (YYYY-MM-DD) is the date the owner was shown; by default today + ttlDays.
+   */
+  createGrant(g: { clientId: string; clientName: string; email: string; redirectHost: string; expiresOn?: string }): GrantView {
     if (!this.clients.has(g.clientId)) throw new Error(`unknown client ${g.clientId}`);
     const now = Date.now();
     const grant: StoredGrant = {
@@ -222,7 +225,7 @@ export class OAuthStore {
       email: g.email,
       redirectHost: g.redirectHost,
       createdAt: now,
-      expiresAt: expiryMs(expiryDayFor(this.opts.ttlDays, now)),
+      expiresAt: expiryMs(g.expiresOn ?? expiryDayFor(this.opts.ttlDays, now)),
       usedRefreshHashes: [],
     };
     this.index(grant);

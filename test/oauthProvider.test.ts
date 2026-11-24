@@ -210,6 +210,18 @@ describe('GscOAuthProvider', () => {
     expect(p.store.grants()).toHaveLength(1);
   });
 
+  it('gives the grant the end date shown on the consent page, across midnight', async () => {
+    vi.setSystemTime(new Date('2026-11-24T23:58:00Z'));
+    const p = setup();
+    const { ret } = await toConsent(p);
+    if (ret.kind !== 'consent') throw new Error('expected consent');
+    expect(ret.expiresOn).toBe('2027-02-22');
+    const code = new URL((p.provider.decideConsent(ret.consentId, ret.csrf, true) as { url: string }).url).searchParams.get('code')!;
+    vi.setSystemTime(new Date('2026-11-25T00:01:00Z'));
+    await p.provider.exchangeAuthorizationCode(CLIENT, code);
+    expect(p.store.grants()[0]!.expiresAt).toBe('2027-02-22T00:00:00.000Z');
+  });
+
   it('refuses to approve for a client that is gone', async () => {
     const p = setup();
     const { ret } = await toConsent(p);
