@@ -2,7 +2,7 @@ import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from '@modelconte
 import express, { type NextFunction, type Request, type Response } from 'express';
 import type { ClientInfo } from '../auth.js';
 import type { Logger } from '../logger.js';
-import { clientsRoutes, OwnerSessions, sessionCookie } from './clients.js';
+import { clientsRoutes, OwnerSessions, readCookie, SESSION_COOKIE, sessionCookie } from './clients.js';
 import { consentPage, errorPage, sendPage } from './pages.js';
 import { safeReason, type GscOAuthProvider } from './provider.js';
 import type { OAuthStore } from './store.js';
@@ -56,6 +56,7 @@ export function oauthRouter(o: OAuthRouterOptions): express.Router {
       case 'redirect':
         return void res.set('Cache-Control', 'no-store').redirect(302, ret.url);
       case 'session':
+        sessions.delete(readCookie(req.headers.cookie, SESSION_COOKIE)); // a new sign-in ends the previous session
         o.logger.info('owner signed in to the clients page', { email: ret.email });
         return void res.set({ 'Cache-Control': 'no-store', 'Set-Cookie': sessionCookie(sessions.create(ret.email)) }).redirect(302, '/clients');
       case 'error':

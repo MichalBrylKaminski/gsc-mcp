@@ -7,7 +7,8 @@ import type { GscOAuthProvider } from './provider.js';
 import type { GrantView, OAuthStore } from './store.js';
 
 export const SESSION_TTL_MS = 43_200_000;
-export const SESSION_COOKIE = 'gsc_mcp_session';
+/** The __Host- prefix makes browsers refuse this cookie from any other host, e.g. a sibling subdomain. */
+export const SESSION_COOKIE = '__Host-gsc_mcp_session';
 /** Owner sessions are few; the cap only stops a runaway loop from growing memory. */
 const MAX_SESSIONS = 100;
 
@@ -121,13 +122,7 @@ export function clientsRoutes(o: ClientsRoutesOptions): express.Router {
 
   router.get('/clients', (req, res) => {
     const { session } = sessionOf(req);
-    if (!session) {
-      try {
-        return void res.set('Cache-Control', 'no-store').redirect(302, o.provider.startSessionSignIn());
-      } catch {
-        return sendPage(res, 429, errorPage('Too many sign-ins are in progress; try again in a few minutes.'));
-      }
-    }
+    if (!session) return void res.set('Cache-Control', 'no-store').redirect(302, o.provider.startSessionSignIn());
     sendPage(res, 200, clientsPage({ email: session.email, csrf: session.csrf, grants: o.store.grants(), fixed: o.fixedClients() }));
   });
 

@@ -80,7 +80,7 @@ The client name comes from registration and is chosen by the client: it is cut t
 
 ## Connected clients page
 
-- `GET /clients`: if there is no session, redirects through Google sign-in (same allowlist), then sets a session cookie: random id, kept in server memory, 12 hours, `HttpOnly; Secure; SameSite=Lax; Path=/`.
+- `GET /clients`: if there is no session, redirects through Google sign-in (same allowlist), then sets a session cookie (`__Host-gsc_mcp_session`): random id, kept in server memory, 12 hours, `HttpOnly; Secure; SameSite=Lax; Path=/`.
 - Lists each grant: client name, redirect host, approved on, expires on, last used. Lists fixed tokens read-only: name and expiry (or "never").
 - `POST /clients/revoke` (one grant) and `POST /clients/revoke-all`, each with the session's CSRF token. `POST /clients/sign-out` ends the session.
 

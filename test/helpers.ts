@@ -11,7 +11,7 @@ import { TokenRegistry, type TokenRegistryOptions } from '../src/auth.js';
 import type { AuthToken } from '../src/config.js';
 import type { GscApi } from '../src/google/client.js';
 import { GscService, type GscServiceOptions } from '../src/google/service.js';
-import { silentLogger } from '../src/logger.js';
+import { silentLogger, type Logger } from '../src/logger.js';
 
 export function fakeApi(overrides: Partial<GscApi> = {}): GscApi {
   return {
@@ -79,15 +79,15 @@ export function fakeGoogle() {
 export const TOKEN = 'test-token-0123456789abcdef0123456789abcdef';
 
 /** An app on a real port with OAuth on, whose issuer is its own address. */
-export async function startOAuthApp(opts: { allowedEmails?: string[] } = {}) {
+export async function startOAuthApp(opts: { allowedEmails?: string[]; logger?: Logger } = {}) {
   const g = fakeGoogle();
   const server = createServer();
   server.listen(0, '127.0.0.1');
   await new Promise((r) => server.once('listening', r));
   const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
   const publicUrl = new URL(base);
-  const store = new OAuthStore({ ttlDays: 90, logger: silentLogger });
-  const provider = new GscOAuthProvider({ store, google: g.google, allowedEmails: opts.allowedEmails ?? ['owner@example.com'], ttlDays: 90, logger: silentLogger });
+  const store = new OAuthStore({ ttlDays: 90, logger: opts.logger ?? silentLogger });
+  const provider = new GscOAuthProvider({ store, google: g.google, allowedEmails: opts.allowedEmails ?? ['owner@example.com'], ttlDays: 90, logger: opts.logger ?? silentLogger });
   const tokens = tokenRegistry([{ label: 'test', token: TOKEN }]);
   const app = createApp({
     tokens,
@@ -95,10 +95,10 @@ export async function startOAuthApp(opts: { allowedEmails?: string[] } = {}) {
     oauth: {
       store,
       resourceMetadataUrl: resourceMetadataUrl(publicUrl, '/gsc-mcp'),
-      router: oauthRouter({ provider, publicUrl, mcpPath: '/gsc-mcp', store, fixedClients: () => tokens.clients(), logger: silentLogger }),
+      router: oauthRouter({ provider, publicUrl, mcpPath: '/gsc-mcp', store, fixedClients: () => tokens.clients(), logger: opts.logger ?? silentLogger }),
     },
-    deps: { service: makeService(fakeApi()), logger: silentLogger, maxRowsPerCall: 25_000 },
-    logger: silentLogger,
+    deps: { service: makeService(fakeApi()), logger: opts.logger ?? silentLogger, maxRowsPerCall: 25_000 },
+    logger: opts.logger ?? silentLogger,
   });
   server.on('request', app);
   return { base, g, store, provider, close: () => new Promise((r) => server.close(r)) };

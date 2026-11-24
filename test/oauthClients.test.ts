@@ -1,10 +1,18 @@
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest';
-import { form, startOAuthApp, TOKEN } from './helpers.js';
+import type { Logger } from '../src/logger.js';
+import { form, pkce, startOAuthApp, TOKEN } from './helpers.js';
 
 describe('Connected clients page', () => {
   let app: Awaited<ReturnType<typeof startOAuthApp>>;
+  const logs: { level: string; msg: string; fields?: Record<string, unknown> }[] = [];
+  const logger: Logger = {
+    debug() {},
+    info: (msg, fields) => logs.push({ level: 'info', msg, fields }),
+    warn: (msg, fields) => logs.push({ level: 'warn', msg, fields }),
+    error: (msg, fields) => logs.push({ level: 'error', msg, fields }),
+  };
   beforeAll(async () => {
-    app = await startOAuthApp();
+    app = await startOAuthApp({ logger });
   });
   afterAll(() => app.close());
   afterEach(() => {
@@ -21,7 +29,7 @@ describe('Connected clients page', () => {
     expect(back.status).toBe(302);
     expect(back.headers.get('location')).toBe('/clients');
     const setCookie = back.headers.get('set-cookie')!;
-    expect(setCookie).toMatch(/^gsc_mcp_session=[\w-]{40,}; Path=\/; Max-Age=43200; HttpOnly; Secure; SameSite=Lax$/);
+    expect(setCookie).toMatch(/^__Host-gsc_mcp_session=[\w-]{40,}; Path=\/; Max-Age=43200; HttpOnly; Secure; SameSite=Lax$/);
     const cookie = setCookie.split(';')[0]!;
     const list = await fetch(`${app.base}/clients`, { headers: { cookie }, redirect: 'manual' });
     expect(list.status).toBe(200);
@@ -39,7 +47,7 @@ describe('Connected clients page', () => {
 
   it('redirects to Google without a session, or with an unknown one', async () => {
     expect((await fetch(`${app.base}/clients`, { redirect: 'manual' })).status).toBe(302);
-    expect((await fetch(`${app.base}/clients`, { headers: { cookie: 'gsc_mcp_session=forged' }, redirect: 'manual' })).status).toBe(302);
+    expect((await fetch(`${app.base}/clients`, { headers: { cookie: '__Host-gsc_mcp_session=forged' }, redirect: 'manual' })).status).toBe(302);
   });
 
   it('signs in and lists grants and fixed tokens', async () => {
@@ -102,15 +110,84 @@ describe('Connected clients page', () => {
     const { cookie, csrf } = await signIn();
     const out = await fetch(`${app.base}/clients/sign-out`, { ...form({ csrf }), headers: { 'content-type': 'application/x-www-form-urlencoded', cookie } });
     expect(out.status).toBe(303);
-    expect(out.headers.get('set-cookie')).toMatch(/^gsc_mcp_session=; Path=\/; Max-Age=0/);
+    expect(out.headers.get('set-cookie')).toMatch(/^__Host-gsc_mcp_session=; Path=\/; Max-Age=0/);
     expect((await fetch(`${app.base}/clients`, { headers: { cookie }, redirect: 'manual' })).status).toBe(302);
   });
 
-  it('escapes names', async () => {
-    grantFor('<b>x</b>');
+  it('escapes names and redirect hosts', async () => {
+    const reg = (await (
+      await fetch(`${app.base}/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ redirect_uris: ['https://x.example/cb'], client_name: '<script>alert(1)</script>' }) })
+    ).json()) as { client_id: string; client_name: string };
+    app.store.createGrant({ clientId: reg.client_id, clientName: reg.client_name, email: 'owner@example.com', redirectHost: '"><img src=x>' });
     const { html } = await signIn();
-    expect(html).toContain('&lt;b&gt;x&lt;/b&gt;');
-    expect(html).not.toContain('<b>x</b>');
+    expect(html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+    expect(html).not.toContain('<script>alert');
+    expect(html).toContain('&quot;&gt;&lt;img src=x&gt;');
+    expect(html).not.toContain('<img src=x>');
+  });
+
+  it('ignores an unknown or empty grant id', async () => {
+    const a = grantFor('Alpha');
+    const { cookie, csrf } = await signIn();
+    for (const grantId of ['nope', '']) {
+      const res = await fetch(`${app.base}/clients/revoke`, { ...form({ csrf, grantId }), headers: { 'content-type': 'application/x-www-form-urlencoded', cookie } });
+      expect(res.status).toBe(303);
+    }
+    expect(await mcpStatus(a.token)).toBe(200);
+  });
+
+  it('does not let a bearer token stand in for a session', async () => {
+    const a = grantFor('Alpha');
+    for (const token of [TOKEN, a.token]) {
+      const res = await fetch(`${app.base}/clients`, { headers: { authorization: `Bearer ${token}` }, redirect: 'manual' });
+      expect(res.status).toBe(302);
+      expect(res.headers.get('location')).toMatch(/^https:\/\/google\.test\//);
+    }
+  });
+
+  it('requires the csrf for revoke-all and sign-out too', async () => {
+    const a = grantFor('Alpha');
+    const { cookie } = await signIn();
+    for (const path of ['/clients/revoke-all', '/clients/sign-out']) {
+      const res = await fetch(`${app.base}${path}`, { ...form({}), headers: { 'content-type': 'application/x-www-form-urlencoded', cookie } });
+      expect(res.status, path).toBe(403);
+    }
+    expect(await mcpStatus(a.token)).toBe(200);
+    expect((await fetch(`${app.base}/clients`, { headers: { cookie }, redirect: 'manual' })).status).toBe(200);
+  });
+
+  it('logs who revoked, without session secrets', async () => {
+    const a = grantFor('Alpha');
+    const { cookie, csrf } = await signIn();
+    await fetch(`${app.base}/clients/revoke`, { ...form({ csrf, grantId: a.grant.id }), headers: { 'content-type': 'application/x-www-form-urlencoded', cookie } });
+    expect(logs).toContainEqual(expect.objectContaining({ msg: 'grant revoked', fields: { client: `oauth:Alpha#${a.grant.id.slice(0, 6)}`, by: 'owner@example.com' } }));
+    const text = JSON.stringify(logs);
+    expect(text).not.toContain(cookie.split('=')[1]!);
+    expect(text).not.toContain(csrf);
+  });
+
+  it('ends the previous session on a new sign-in', async () => {
+    const first = await signIn();
+    await fetch(`${app.base}/clients`, { redirect: 'manual' });
+    const back = await fetch(`${app.base}/oauth/google/callback?state=${encodeURIComponent(app.g.lastState())}&code=c`, { headers: { cookie: first.cookie }, redirect: 'manual' });
+    expect(back.status).toBe(302);
+    expect((await fetch(`${app.base}/clients`, { headers: { cookie: first.cookie }, redirect: 'manual' })).status).toBe(302);
+  });
+
+  it('never lets clients-page sign-ins block client sign-ins', async () => {
+    for (let i = 0; i < 1100; i++) await fetch(`${app.base}/clients`, { redirect: 'manual' });
+    const reg = (await (
+      await fetch(`${app.base}/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ redirect_uris: ['http://127.0.0.1:9/cb'], token_endpoint_auth_method: 'none' }) })
+    ).json()) as { client_id: string };
+    const authorize = new URL(`${app.base}/authorize`);
+    for (const [k, v] of Object.entries({ response_type: 'code', client_id: reg.client_id, redirect_uri: 'http://127.0.0.1:9/cb', code_challenge: pkce().challenge, code_challenge_method: 'S256' })) authorize.searchParams.set(k, v);
+    const res = await fetch(authorize, { redirect: 'manual' });
+    expect(res.status).toBe(302);
+    expect(res.headers.get('location')).toMatch(/^https:\/\/google\.test\//);
+    // The newest clients-page sign-in still works.
+    await fetch(`${app.base}/clients`, { redirect: 'manual' });
+    const back = await fetch(`${app.base}/oauth/google/callback?state=${encodeURIComponent(app.g.lastState())}&code=c`, { redirect: 'manual' });
+    expect(back.headers.get('location')).toBe('/clients');
   });
 
   it('serves the page with no-store and no framing', async () => {

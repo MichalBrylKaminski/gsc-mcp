@@ -12,8 +12,14 @@ import { cleanClientName, type OAuthStore } from './store.js';
 
 /** How long a started sign-in, a consent page and an authorization code stay usable. */
 export const PENDING_TTL_MS = 300_000;
-/** Cap on in-flight sign-ins, so /authorize spam can't grow memory without bound. */
+/** Cap on in-flight client sign-ins, so /authorize spam can't grow memory without bound. */
 const MAX_PENDING = 1000;
+/**
+ * Sign-ins for the Connected clients page are kept apart, few, and the oldest
+ * is dropped when full: anyone can start one with GET /clients, and that must
+ * never block client sign-ins.
+ */
+const MAX_SESSION_PENDING = 20;
 
 export type GoogleReturn =
   | { kind: 'consent'; consentId: string; csrf: string; clientName: string; redirectHost: string; expiresOn: string }
@@ -90,6 +96,7 @@ function redirectWith(redirectUri: string, params: Record<string, string | undef
 export class GscOAuthProvider implements OAuthServerProvider {
   /** Keyed by the `state` we sent to Google. */
   private readonly pending = new Map<string, Pending>();
+  private readonly sessionPending = new Map<string, Pending>();
   private readonly consents = new Map<string, Consent>();
   private readonly codes = new Map<string, Code>();
   private readonly allowed: Set<string>;
@@ -121,10 +128,18 @@ export class GscOAuthProvider implements OAuthServerProvider {
   }
 
   private startGoogle(p: { kind: 'authorize'; clientId: string; params: AuthorizationParams } | { kind: 'session' }): string {
-    this.sweep(this.pending);
+    let map = this.pending;
+    if (p.kind === 'session') {
+      map = this.sessionPending;
+      const now = Date.now();
+      for (const [k, v] of map) if (now >= v.expiresAt) map.delete(k);
+      while (map.size >= MAX_SESSION_PENDING) map.delete(map.keys().next().value!);
+    } else {
+      this.sweep(map);
+    }
     const state = random();
     const nonce = random();
-    this.pending.set(state, { ...p, nonce, expiresAt: Date.now() + PENDING_TTL_MS } as Pending);
+    map.set(state, { ...p, nonce, expiresAt: Date.now() + PENDING_TTL_MS } as Pending);
     return this.o.google.authUrl(state, nonce);
   }
 
@@ -139,7 +154,7 @@ export class GscOAuthProvider implements OAuthServerProvider {
 
   /** Handles Google's redirect back to /oauth/google/callback. */
   async handleGoogleReturn(q: { state?: string; code?: string; error?: string }): Promise<GoogleReturn> {
-    const p = this.take(this.pending, q.state);
+    const p = this.take(this.pending, q.state) ?? this.take(this.sessionPending, q.state);
     if (!p) return { kind: 'error', status: 400, message: STALE };
     const denied = (reason: string, email?: string): GoogleReturn => {
       if (email !== undefined) this.o.logger.warn('sign-in refused', { email, reason });
