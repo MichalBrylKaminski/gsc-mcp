@@ -46,6 +46,9 @@ export interface ToolContext {
 export function tokenNotice(client: ClientInfo | undefined): string | undefined {
   if (client?.daysLeft === undefined || client.daysLeft > EXPIRY_WARNING_DAYS) return undefined;
   const when = client.daysLeft <= 1 ? 'within a day' : `in ${client.daysLeft} days`;
+  if (client.signIn) {
+    return `This client's sign-in (${client.name}) expires ${when}, at ${client.expiresAt}. Reconnect it and sign in with Google again to keep access.`;
+  }
   return `This client's token (${client.name}) expires ${when}, at ${client.expiresAt}. Tell the server owner so they can issue a new one.`;
 }
 
