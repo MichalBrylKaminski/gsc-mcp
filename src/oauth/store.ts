@@ -1,0 +1,324 @@
+import { createHash, randomBytes, randomUUID } from 'node:crypto';
+import { readFileSync, renameSync } from 'node:fs';
+import { InvalidClientMetadataError, InvalidGrantError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
+import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
+import { DAY_MS, EXPIRY_WARNING_DAYS, expiryDayFor, expiryMs, utcDay, type ClientInfo } from '../auth.js';
+import { JsonFile } from '../limits/limiter.js';
+import type { Logger } from '../logger.js';
+
+export const ACCESS_TOKEN_TTL_MS = 3_600_000;
+/** A registered client that never got a grant is forgotten after this long. */
+export const UNUSED_CLIENT_TTL_MS = 86_400_000;
+export const MAX_CLIENTS = 100;
+/** How often a changed "last used" time is saved. */
+export const LAST_USED_FLUSH_MS = 60_000;
+export const CLIENT_NAME_MAX = 64;
+
+/** What the Connected clients page and logs may know about a grant. */
+export interface GrantView {
+  id: string;
+  clientId: string;
+  clientName: string;
+  email: string;
+  redirectHost: string;
+  createdAt: string;
+  expiresAt: string;
+  lastUsedAt?: string;
+}
+
+export interface IssuedTokens {
+  access_token: string;
+  token_type: 'bearer';
+  expires_in: number;
+  refresh_token: string;
+}
+
+interface StoredGrant {
+  id: string;
+  clientId: string;
+  clientName: string;
+  email: string;
+  redirectHost: string;
+  createdAt: number;
+  expiresAt: number;
+  lastUsedAt?: number;
+  accessHash?: string;
+  accessExpiresAt?: number;
+  refreshHash?: string;
+  /** Refresh tokens already exchanged; seeing one again means it was copied. */
+  usedRefreshHashes: string[];
+}
+
+type StoredClient = OAuthClientInformationFull & { registeredAt: number };
+
+interface State {
+  version: 1;
+  clients: StoredClient[];
+  grants: StoredGrant[];
+}
+
+export interface OAuthStoreOptions {
+  /** Where to persist; omit to keep everything in memory (tests). */
+  file?: string;
+  /** Grant lifetime: a grant ends at 00:00 UTC on (approval day + ttlDays). */
+  ttlDays: number;
+  logger: Logger;
+}
+
+const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
+const newToken = () => randomBytes(32).toString('base64url');
+const iso = (ms: number) => new Date(ms).toISOString();
+
+/** A client-chosen name, safe to show and log: no control or format characters, at most 64 characters. */
+export function cleanClientName(name: string | undefined): string {
+  const cleaned = (name ?? '').replace(/[\p{C}]/gu, '').trim().slice(0, CLIENT_NAME_MAX).trim();
+  return cleaned || 'client';
+}
+
+/**
+ * Registered OAuth clients and the grants the owner approved, with their
+ * current tokens. Tokens are kept only as SHA-256 hashes, in memory and on disk.
+ */
+export class OAuthStore {
+  private readonly clients = new Map<string, StoredClient>();
+  private readonly grantsById = new Map<string, StoredGrant>();
+  private readonly byAccess = new Map<string, StoredGrant>();
+  private readonly byRefresh = new Map<string, StoredGrant>();
+  private readonly byUsedRefresh = new Map<string, StoredGrant>();
+  /** grant id -> the UTC day its "expires soon" warning was last logged. */
+  private readonly warnedOn = new Map<string, string>();
+  private readonly file: JsonFile<State>;
+  private lastUsedDirty = false;
+  private readonly timer: NodeJS.Timeout;
+
+  constructor(private readonly opts: OAuthStoreOptions) {
+    this.file = new JsonFile<State>(opts.file, 'OAuth state', opts.logger);
+    this.load();
+    this.prune();
+    this.timer = setInterval(() => {
+      if (this.lastUsedDirty) this.save();
+    }, LAST_USED_FLUSH_MS);
+    this.timer.unref();
+  }
+
+  private load(): void {
+    const path = this.opts.file;
+    if (!path) return;
+    let text: string;
+    try {
+      text = readFileSync(path, 'utf8');
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
+      this.opts.logger.error('OAuth state unreadable; starting with no sign-ins', { file: path, error: (err as Error).message });
+      return;
+    }
+    try {
+      const state = JSON.parse(text) as State;
+      if (state?.version !== 1 || !Array.isArray(state.clients) || !Array.isArray(state.grants)) throw new Error('unexpected format');
+      for (const c of state.clients) this.clients.set(c.client_id, c);
+      for (const g of state.grants) this.index({ ...g, usedRefreshHashes: g.usedRefreshHashes ?? [] });
+    } catch (err) {
+      const aside = `${path}.corrupt-${Date.now()}`;
+      try {
+        renameSync(path, aside);
+      } catch {
+        // If it can't be moved, the next save overwrites it.
+      }
+      this.clients.clear();
+      for (const m of [this.grantsById, this.byAccess, this.byRefresh, this.byUsedRefresh]) m.clear();
+      this.opts.logger.error('OAuth state is corrupt; set aside, starting with no sign-ins', { file: path, movedTo: aside, error: (err as Error).message });
+    }
+  }
+
+  private index(g: StoredGrant): void {
+    this.grantsById.set(g.id, g);
+    if (g.accessHash) this.byAccess.set(g.accessHash, g);
+    if (g.refreshHash) this.byRefresh.set(g.refreshHash, g);
+    for (const h of g.usedRefreshHashes) this.byUsedRefresh.set(h, g);
+  }
+
+  private save(): void {
+    this.lastUsedDirty = false;
+    this.file.save(() => ({ version: 1, clients: [...this.clients.values()], grants: [...this.grantsById.values()] }));
+  }
+
+  getClient(id: string): OAuthClientInformationFull | undefined {
+    const c = this.clients.get(id);
+    if (!c) return undefined;
+    const { registeredAt: _r, ...client } = c;
+    return client;
+  }
+
+  /** Called by the SDK's /register handler, which has already assigned client_id. */
+  registerClient(info: Omit<OAuthClientInformationFull, 'client_id' | 'client_id_issued_at'>): OAuthClientInformationFull {
+    if (this.clients.size >= MAX_CLIENTS) this.prune();
+    if (this.clients.size >= MAX_CLIENTS) throw new InvalidClientMetadataError('This server has too many registered clients; try again tomorrow.');
+    const client = { ...info } as OAuthClientInformationFull;
+    if (!client.client_id) client.client_id = randomUUID();
+    this.clients.set(client.client_id, { ...client, registeredAt: Date.now() });
+    this.save();
+    return client;
+  }
+
+  /** Records the owner's approval. The grant has no tokens until issueTokens. */
+  createGrant(g: { clientId: string; clientName: string; email: string; redirectHost: string }): GrantView {
+    if (!this.clients.has(g.clientId)) throw new Error(`unknown client ${g.clientId}`);
+    const now = Date.now();
+    const grant: StoredGrant = {
+      id: randomBytes(16).toString('hex'),
+      clientId: g.clientId,
+      clientName: cleanClientName(g.clientName),
+      email: g.email,
+      redirectHost: g.redirectHost,
+      createdAt: now,
+      expiresAt: expiryMs(expiryDayFor(this.opts.ttlDays, now)),
+      usedRefreshHashes: [],
+    };
+    this.index(grant);
+    this.save();
+    return this.view(grant);
+  }
+
+  /** A fresh access and refresh token for a grant, replacing any it had. */
+  issueTokens(grantId: string): IssuedTokens {
+    const g = this.grantsById.get(grantId);
+    if (!g || Date.now() >= g.expiresAt) throw new InvalidGrantError('The sign-in has ended; sign in again.');
+    return this.rotate(g);
+  }
+
+  private rotate(g: StoredGrant): IssuedTokens {
+    if (g.accessHash) this.byAccess.delete(g.accessHash);
+    if (g.refreshHash) this.byRefresh.delete(g.refreshHash);
+    const access = newToken();
+    const refresh = newToken();
+    const now = Date.now();
+    g.accessHash = sha256(access);
+    g.accessExpiresAt = Math.min(now + ACCESS_TOKEN_TTL_MS, g.expiresAt);
+    g.refreshHash = sha256(refresh);
+    this.byAccess.set(g.accessHash, g);
+    this.byRefresh.set(g.refreshHash, g);
+    this.save();
+    return { access_token: access, token_type: 'bearer', expires_in: Math.max(0, Math.floor((g.accessExpiresAt - now) / 1000)), refresh_token: refresh };
+  }
+
+  /**
+   * Exchanges a refresh token for a new pair. Each refresh token works once;
+   * one that comes back after use was copied, so the whole grant is revoked.
+   */
+  refresh(clientId: string, refreshToken: string): IssuedTokens {
+    const hash = sha256(refreshToken);
+    const reused = this.byUsedRefresh.get(hash);
+    if (reused) {
+      this.opts.logger.error('refresh token reused', { client: this.label(reused), note: 'the grant was revoked; the client must sign in again' });
+      this.removeGrant(reused);
+      throw new InvalidGrantError('This refresh token was already used. The sign-in was revoked; sign in again.');
+    }
+    const g = this.byRefresh.get(hash);
+    if (!g || g.clientId !== clientId) throw new InvalidGrantError('Unknown refresh token.');
+    if (Date.now() >= g.expiresAt) {
+      this.removeGrant(g);
+      throw new InvalidGrantError('The sign-in has ended; sign in again.');
+    }
+    g.usedRefreshHashes.push(hash);
+    this.byUsedRefresh.set(hash, g);
+    return this.rotate(g);
+  }
+
+  /** The client behind a valid access token, or undefined. Records the use. */
+  verifyAccess(token: string): ClientInfo | undefined {
+    const g = this.byAccess.get(sha256(token));
+    const now = Date.now();
+    if (!g || g.accessExpiresAt === undefined || now >= g.accessExpiresAt || now >= g.expiresAt) return undefined;
+    g.lastUsedAt = now;
+    this.lastUsedDirty = true;
+    const client: ClientInfo = { name: this.label(g), expiresAt: iso(g.expiresAt), daysLeft: Math.ceil((g.expiresAt - now) / DAY_MS), signIn: true };
+    if (client.daysLeft! <= EXPIRY_WARNING_DAYS && this.warnedOn.get(g.id) !== utcDay(now)) {
+      this.warnedOn.set(g.id, utcDay(now));
+      this.opts.logger.warn('sign-in expires soon', { client: client.name, expiresAt: client.expiresAt, daysLeft: client.daysLeft });
+    }
+    return client;
+  }
+
+  /** Revokes the grant behind an access or refresh token (RFC 7009); unknown tokens are ignored. */
+  revokeToken(token: string): void {
+    const hash = sha256(token);
+    const g = this.byAccess.get(hash) ?? this.byRefresh.get(hash) ?? this.byUsedRefresh.get(hash);
+    if (g) this.removeGrant(g);
+  }
+
+  revokeGrant(id: string): boolean {
+    const g = this.grantsById.get(id);
+    if (!g) return false;
+    this.removeGrant(g);
+    return true;
+  }
+
+  revokeAll(): number {
+    const n = this.grantsById.size;
+    for (const g of [...this.grantsById.values()]) this.removeGrant(g, false);
+    if (n) this.save();
+    return n;
+  }
+
+  private removeGrant(g: StoredGrant, save = true): void {
+    this.grantsById.delete(g.id);
+    if (g.accessHash) this.byAccess.delete(g.accessHash);
+    if (g.refreshHash) this.byRefresh.delete(g.refreshHash);
+    for (const h of g.usedRefreshHashes) this.byUsedRefresh.delete(h);
+    this.warnedOn.delete(g.id);
+    if (save) this.save();
+  }
+
+  /** Newest first. */
+  grants(): GrantView[] {
+    return [...this.grantsById.values()].sort((a, b) => b.createdAt - a.createdAt).map((g) => this.view(g));
+  }
+
+  /** Drops expired grants, and clients that registered over a day ago and have no grant. */
+  prune(): void {
+    const now = Date.now();
+    let changed = false;
+    for (const g of [...this.grantsById.values()]) {
+      if (now >= g.expiresAt) {
+        this.removeGrant(g, false);
+        changed = true;
+      }
+    }
+    const inUse = new Set([...this.grantsById.values()].map((g) => g.clientId));
+    for (const [id, c] of this.clients) {
+      if (!inUse.has(id) && now - c.registeredAt > UNUSED_CLIENT_TTL_MS) {
+        this.clients.delete(id);
+        changed = true;
+      }
+    }
+    if (changed) this.save();
+  }
+
+  /** Saves pending changes (including last-use times) and waits for the write. */
+  async flush(): Promise<void> {
+    if (this.lastUsedDirty) this.save();
+    await this.file.flush();
+  }
+
+  /** Stops the periodic save; call on shutdown after flush(). */
+  close(): void {
+    clearInterval(this.timer);
+  }
+
+  private label(g: StoredGrant): string {
+    return `oauth:${g.clientName}#${g.id.slice(0, 6)}`;
+  }
+
+  private view(g: StoredGrant): GrantView {
+    return {
+      id: g.id,
+      clientId: g.clientId,
+      clientName: g.clientName,
+      email: g.email,
+      redirectHost: g.redirectHost,
+      createdAt: iso(g.createdAt),
+      expiresAt: iso(g.expiresAt),
+      ...(g.lastUsedAt !== undefined ? { lastUsedAt: iso(g.lastUsedAt) } : {}),
+    };
+  }
+}

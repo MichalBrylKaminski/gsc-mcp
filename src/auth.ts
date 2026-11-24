@@ -2,7 +2,7 @@ import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import type { AuthToken } from './config.js';
 import type { Logger } from './logger.js';
 
-const DAY_MS = 86_400_000;
+export const DAY_MS = 86_400_000;
 /** Warn in the logs and in tool responses when a token has this many days or fewer left. */
 export const EXPIRY_WARNING_DAYS = 14;
 
@@ -18,6 +18,8 @@ export interface ClientInfo {
   /** Only with auto-expire. */
   expiresAt?: string;
   daysLeft?: number;
+  /** Set for OAuth clients: renewing means signing in again, not asking for a new token. */
+  signIn?: true;
 }
 
 export type CheckResult = { kind: 'ok'; client: ClientInfo } | { kind: 'expired'; name: string } | { kind: 'unknown' };
@@ -29,7 +31,7 @@ interface Entry {
 }
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest();
-const utcDay = (ms: number) => new Date(ms).toISOString().slice(0, 10);
+export const utcDay = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 
 /** When a token dated `expiresOn` (YYYY-MM-DD) stops working: 00:00 UTC that day. */
 export const expiryMs = (expiresOn: string) => Date.parse(`${expiresOn}T00:00:00Z`);
@@ -38,9 +40,14 @@ export const expiryMs = (expiresOn: string) => Date.parse(`${expiresOn}T00:00:00
  * A new random token whose expiry date is `ttlDays` from today (UTC), and the
  * entry to put in MCP_AUTH_TOKENS: "name:token:YYYY-MM-DD".
  */
+/** The expiry date (YYYY-MM-DD) of something issued now with a lifetime of `ttlDays`: today (UTC) + ttlDays. */
+export function expiryDayFor(ttlDays: number, now = Date.now()): string {
+  return utcDay(Date.parse(`${utcDay(now)}T00:00:00Z`) + ttlDays * DAY_MS);
+}
+
 export function issueToken(name: string, ttlDays: number, now = Date.now()) {
   const token = randomBytes(32).toString('hex');
-  const expiresOn = utcDay(Date.parse(`${utcDay(now)}T00:00:00Z`) + ttlDays * DAY_MS);
+  const expiresOn = expiryDayFor(ttlDays, now);
   return { name, token, expiresOn, entry: `${name}:${token}:${expiresOn}` };
 }
 
