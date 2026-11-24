@@ -210,6 +210,15 @@ describe('OAuth flow', () => {
     expect(app.store.grants()).toHaveLength(before);
   });
 
+  it('answers a failing Google callback with an error page', async () => {
+    const spy = vi.spyOn(app.provider, 'handleGoogleReturn').mockRejectedValueOnce(new Error('Invalid token signature: eyJsecret'));
+    const res = await fetch(`${app.base}/oauth/google/callback?state=s&code=c`);
+    spy.mockRestore();
+    expect(res.status).toBe(500);
+    expect(res.headers.get('content-type')).toMatch(/text\/html/);
+    expect(await res.text()).not.toContain('eyJsecret');
+  });
+
   it('answers oversized or malformed consent forms with a page', async () => {
     const big = await fetch(`${app.base}/oauth/consent`, form({ consentId: 'x'.repeat(5000), csrf: 'y', decision: 'approve' }));
     expect(big.status).toBe(413);
