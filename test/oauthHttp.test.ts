@@ -12,6 +12,7 @@ import { OAuthStore } from '../src/oauth/store.js';
 import { fakeApi, makeService, tokenRegistry } from './helpers.js';
 
 const TOKEN = 'test-token-0123456789abcdef0123456789abcdef';
+const OLD_TOKEN = 'old-token-0123456789abcdef0123456789abcdef';
 
 describe('bearer check with OAuth', () => {
   let server: Server;
@@ -24,7 +25,13 @@ describe('bearer check with OAuth', () => {
     store = new OAuthStore({ file: join(mkdtempSync(join(tmpdir(), 'gsc-mcp-oauth-')), 'oauth-state.json'), ttlDays: 90, logger: silentLogger });
     store.registerClient({ client_id: 'grok', redirect_uris: ['https://grok.example/cb'] } as never);
     const app = createApp({
-      tokens: tokenRegistry([{ label: 'test', token: TOKEN }]),
+      tokens: tokenRegistry(
+        [
+          { label: 'test', token: TOKEN },
+          { label: 'old', token: OLD_TOKEN, expiresOn: '2020-01-01' },
+        ],
+        { autoExpire: true },
+      ),
       mcpPath: '/gsc-mcp',
       oauth: { store, resourceMetadataUrl: 'https://mcp.example/.well-known/oauth-protected-resource/gsc-mcp' },
       deps: { service: makeService(fakeApi()), logger: silentLogger, maxRowsPerCall: 25_000 },
@@ -69,6 +76,24 @@ describe('bearer check with OAuth', () => {
     const wrong = await fetch(`${base}/gsc-mcp`, { method: 'POST', headers: { ...headers, authorization: 'Bearer nope' }, body });
     expect(wrong.status).toBe(401);
     expect(wrong.headers.get('www-authenticate')).toBe(`Bearer error="invalid_token", ${meta}`);
+  });
+
+  it('keeps an expired fixed token expired, with the metadata pointer', async () => {
+    const res = await fetch(`${base}/gsc-mcp`, { method: 'POST', headers: { ...headers, authorization: `Bearer ${OLD_TOKEN}` }, body });
+    expect(res.status).toBe(401);
+    expect(res.headers.get('www-authenticate')).toBe(
+      'Bearer error="invalid_token", error_description="The token has expired", resource_metadata="https://mcp.example/.well-known/oauth-protected-resource/gsc-mcp"',
+    );
+  });
+
+  it('rejects an access token after its hour', async () => {
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date('2026-11-24T15:00:00Z'));
+    const token = newAccessToken();
+    vi.setSystemTime(new Date(Date.parse('2026-11-24T15:00:00Z') + 3_600_001));
+    const res = await fetch(`${base}/gsc-mcp`, { method: 'POST', headers: { ...headers, authorization: `Bearer ${token}` }, body });
+    expect(res.status).toBe(401);
+    expect(res.headers.get('www-authenticate')).toMatch(/^Bearer error="invalid_token", resource_metadata=/);
   });
 
   it('rejects a revoked grant immediately', async () => {

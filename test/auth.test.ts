@@ -123,7 +123,7 @@ describe('expiry over HTTP', () => {
         body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
       });
       expect(expired.status).toBe(401);
-      expect(expired.headers.get('www-authenticate')).toMatch(/invalid_token/);
+      expect(expired.headers.get('www-authenticate')).toBe('Bearer error="invalid_token", error_description="The token has expired"');
       expect(await expired.json()).toMatchObject({ error: { message: expect.stringMatching(/expired/) } });
       expect(lines).toContainEqual(expect.objectContaining({ msg: 'unauthorized request', fields: { reason: 'expired token', client: 'old' } }));
 

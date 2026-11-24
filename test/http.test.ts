@@ -37,8 +37,12 @@ describe('HTTP transport', () => {
   it('rejects missing and wrong tokens', async () => {
     const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
     const headers = { 'content-type': 'application/json', accept: 'application/json, text/event-stream' };
-    expect((await fetch(`${base}/mcp`, { method: 'POST', headers, body })).status).toBe(401);
-    expect((await fetch(`${base}/mcp`, { method: 'POST', headers: { ...headers, authorization: 'Bearer nope' }, body })).status).toBe(401);
+    const none = await fetch(`${base}/mcp`, { method: 'POST', headers, body });
+    expect(none.status).toBe(401);
+    expect(none.headers.get('www-authenticate')).toBe('Bearer');
+    const wrong = await fetch(`${base}/mcp`, { method: 'POST', headers: { ...headers, authorization: 'Bearer nope' }, body });
+    expect(wrong.status).toBe(401);
+    expect(wrong.headers.get('www-authenticate')).toBe('Bearer');
   });
 
   it('lists exactly the read-only tools', async () => {

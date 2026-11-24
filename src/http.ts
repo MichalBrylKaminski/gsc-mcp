@@ -54,7 +54,7 @@ export function bearerAuth(tokens: TokenRegistry, logger: Logger, oauth?: Pick<H
     const match = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? '');
     const given = match?.[1]!.trim();
     const result = given !== undefined ? tokens.check(given) : undefined;
-    const client: ClientInfo | undefined = result?.kind === 'ok' ? result.client : given !== undefined && result?.kind === 'unknown' ? oauth?.store.verifyAccess(given) : undefined;
+    const client: ClientInfo | undefined = result?.kind === 'ok' ? result.client : result?.kind === 'unknown' ? oauth?.store.verifyAccess(given!) : undefined;
     if (client) {
       res.locals.client = client.name;
       req.auth = {
@@ -97,7 +97,8 @@ export function createApp({ tokens, oauth, trustProxy, allowedHosts, mcpPath = '
     res.json({ status: 'ok' });
   });
 
-  if (oauth?.router) app.use(oauth.router);
+  // The OAuth endpoints and pages answer only for the allowed hosts too (DNS-rebinding protection).
+  if (oauth?.router) app.use(...(allowedHosts?.length ? [hostHeaderValidation(allowedHosts)] : []), oauth.router);
 
   const mcp = express.Router();
   if (allowedHosts?.length) mcp.use(hostHeaderValidation(allowedHosts));
