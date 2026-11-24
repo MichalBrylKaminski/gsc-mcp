@@ -98,7 +98,7 @@ OAuth is on only when all four are set; a partial set is a startup error; none s
 Other changes:
 
 - With OAuth on, `MCP_AUTH_TOKEN`/`MCP_AUTH_TOKENS` become optional.
-- `TRUST_PROXY` (default unset): number of proxies in front of the app, passed to Express `trust proxy`, so the SDK's rate limits see real client IPs. `2` on the VPS (Cloudflare and nginx). With OAuth on and `TRUST_PROXY` unset, log a warning at startup.
+- `TRUST_PROXY` (default unset): number of proxies in front of the app, passed to Express `trust proxy`, so the SDK's rate limits see real client IPs. `2` on the VPS (Cloudflare and nginx), which also needs Dokku's nginx to append to `X-Forwarded-For` (`x-forwarded-for-value '$proxy_add_x_forwarded_for'`) instead of replacing it. If `ALLOWED_HOSTS` is set, it must include the host of `MCP_PUBLIC_URL` (checked at startup). With OAuth on and `TRUST_PROXY` unset, log a warning at startup.
 - `MCP_AUTH_TOKEN_TTL_DAYS` now also sets the OAuth grant lifetime.
 
 ## Google setup (once)

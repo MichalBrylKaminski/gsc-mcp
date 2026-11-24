@@ -254,10 +254,16 @@ server {
     location = /healthz {
         proxy_pass http://127.0.0.1:3000;
     }
+    # Only with OAuth sign-in: the sign-in endpoints and pages live at the root of the domain.
+    location ~ ^/(\.well-known/oauth-|register$|authorize$|token$|revoke$|oauth/|clients) {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;   # with TRUST_PROXY=1
+    }
 }
 ```
 
-**Serving under a sub-path.** To publish the endpoint at `https://example.com/gsc-mcp` instead of `/mcp`, set `MCP_PATH=/gsc-mcp` and proxy that path without rewriting it. Health checks stay at `/healthz`.
+**Serving under a sub-path.** To publish the endpoint at `https://example.com/gsc-mcp` instead of `/mcp`, set `MCP_PATH=/gsc-mcp` and proxy that path without rewriting it. Health checks stay at `/healthz`. [OAuth sign-in](#oauth-sign-in) still uses paths at the root of the domain (`/.well-known/…`, `/authorize`, `/clients`, …), so with OAuth only one such server can live on a hostname.
 
 **Cloudflare.** Proxied requests are cut off after 100 seconds. The server stops batch inspections at 90 seconds for this reason, so no extra setting is needed.
 
@@ -368,7 +374,7 @@ claude mcp add --transport http --scope user gsc https://gsc-mcp.example.com/mcp
 
 ### Claude Desktop
 
-Claude Desktop's custom connectors (Settings → Connectors) support only OAuth, not a fixed bearer token. Instead, connect through the [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) bridge, which needs Node.js. Open Settings → Developer → Edit Config and add this to `claude_desktop_config.json`:
+Claude Desktop's custom connectors (Settings → Connectors), like claude.ai's, support only OAuth, not a fixed bearer token. If the server has [OAuth sign-in](#oauth-sign-in) on, add the endpoint URL there (`https://gsc-mcp.example.com/mcp`) and sign in when asked. With a fixed token, connect through the [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) bridge, which needs Node.js. Open Settings → Developer → Edit Config and add this to `claude_desktop_config.json`:
 
 ```json
 {
@@ -441,7 +447,7 @@ All settings are environment variables. With Docker Compose they go in `.env`.
 | `GOOGLE_OAUTH_CLIENT_ID` | (off) | OAuth sign-in: the client ID of your Google OAuth client (Web application) |
 | `GOOGLE_OAUTH_CLIENT_SECRET` | (off) | OAuth sign-in: that client's secret. Keep it out of the repository |
 | `MCP_OAUTH_ALLOWED_EMAILS` | (off) | OAuth sign-in: comma-separated Google accounts that may approve clients and open `/clients`, e.g. `you@example.com` (case doesn't matter) |
-| `TRUST_PROXY` | (unset) | Number of reverse proxies in front of the server (e.g. `2` for Cloudflare plus nginx), so the sign-in endpoints' rate limits see real client addresses. The server warns at startup when OAuth is on and this is unset |
+| `TRUST_PROXY` | (unset) | Number of reverse proxies in front of the server that append to `X-Forwarded-For` (e.g. `2` for Cloudflare plus nginx), so the sign-in endpoints' rate limits see real client addresses. Never set it higher than the real number, or clients can fake their address. `0` means none (and silences the startup warning OAuth gives when it is unset). nginx must append rather than replace the header: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for` (on Dokku: `dokku nginx:set <app> x-forwarded-for-value '$proxy_add_x_forwarded_for'`) |
 | `GOOGLE_APPLICATION_CREDENTIALS` | **required** | Path to the service account JSON key. Docker Compose sets it to the mounted secret |
 | `DATA_DIR` | `./data` (`/data` in Docker) | Writable directory for quota counters, pauses and, with OAuth, `oauth-state.json` (sign-ins, token hashes only) |
 | `HOST` | `0.0.0.0` | Interface to listen on |
@@ -489,7 +495,7 @@ Google's published limits ([source](https://developers.google.com/webmaster-tool
 - **Bearer tokens.** Every MCP request needs a valid token, compared in constant time. Treat tokens like passwords. Give each client its own token in `MCP_AUTH_TOKENS`, so you can revoke one without touching the others.
 - **Host check.** Set `ALLOWED_HOSTS` to your domain to reject requests addressed to other hostnames (DNS-rebinding protection).
 - **Property allowlist.** Set `GSC_ALLOWED_SITES` to limit what clients can read, even if the service account has access to more properties.
-- **OAuth sign-in (optional).** Clients such as Claude Code and Grok can get and renew their own credentials: you approve each one by signing in with Google (only the accounts you allow) and clicking Approve. A leaked token can't be used to get new ones. See [OAuth sign-in](#oauth-sign-in).
+- **OAuth sign-in (optional).** Clients such as Claude Code and Grok can get and renew their own credentials: you approve each one by signing in with Google (only the accounts you allow) and clicking Approve. Nothing a client stores can start a new sign-in: a leaked access token expires within an hour, and a refresh token works once, so reusing one revokes the sign-in. See [OAuth sign-in](#oauth-sign-in).
 - **Token expiry (optional).** With `MCP_AUTH_AUTO_EXPIRE=true`, every token carries an expiry date and stops working on it, so rotation is enforced rather than suggested. See [Token expiry](#token-expiry).
 - **Key handling.** Keep the key out of the repository (`secrets/` is ignored), readable only by the server's user. If it leaks, replace it as described below.
 - **Container hardening.** The Compose file binds to `127.0.0.1`, runs as a non-root user with a read-only filesystem, drops all capabilities and sets `no-new-privileges`.
@@ -511,18 +517,19 @@ Optional, and it works alongside the fixed tokens: the server accepts a fixed to
 
 **Setup, once:**
 
-1. In the Google Cloud project that holds the service account, open **APIs & Services → OAuth consent screen**. Choose **External**, fill in the app name and your email, and add your Google account as a **test user**. You can leave the app in **Testing**: the server only reads your email from Google and keeps no Google tokens, so Testing mode's 7-day token limit doesn't matter and no verification is needed.
-2. **APIs & Services → Credentials → Create credentials → OAuth client ID → Web application.** Add the authorized redirect URI `https://<your server>/oauth/google/callback`.
+1. In the Google Cloud project that holds the service account, open **Google Auth Platform** (formerly *APIs & Services → OAuth consent screen*). Under **Branding**, fill in the app name and your email; under **Audience**, choose **External** and add your Google account as a **test user**. You can leave the app in **Testing**: the server only reads your email from Google and keeps no Google tokens, so Testing mode's 7-day token limit doesn't matter and no verification is needed.
+2. Under **Clients**, create a client of type **Web application** and add the authorized redirect URI `https://<your server>/oauth/google/callback`.
 3. Set `MCP_PUBLIC_URL`, `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `MCP_OAUTH_ALLOWED_EMAILS` and, behind proxies, `TRUST_PROXY`, then restart. On Dokku:
 
    ```bash
+   dokku nginx:set gsc-mcp x-forwarded-for-value '$proxy_add_x_forwarded_for'
    dokku config:set gsc-mcp MCP_PUBLIC_URL=https://gsc-mcp.example.com GOOGLE_OAUTH_CLIENT_ID=… \
-     GOOGLE_OAUTH_CLIENT_SECRET=… MCP_OAUTH_ALLOWED_EMAILS=you@example.com TRUST_PROXY=2
+     GOOGLE_OAUTH_CLIENT_SECRET=… MCP_OAUTH_ALLOWED_EMAILS=you@example.com TRUST_PROXY=2   # 2 = Cloudflare + nginx
    ```
 
 4. Check: `curl -s https://<your server>/.well-known/oauth-authorization-server` lists the endpoints.
 
-The OAuth endpoints and pages are served at the root of the domain (`/.well-known/…`, `/register`, `/authorize`, `/token`, `/revoke`, `/oauth/…`, `/clients`), so a reverse proxy must pass those paths to the server, not only the MCP path. Only hashes of tokens are stored, in `DATA_DIR/oauth-state.json`; a copy of that file can't be used to call the server. Registered clients are always treated as public clients (PKCE protects the code exchange), so no client secret is stored either.
+The OAuth endpoints and pages are served at the root of the domain (`/.well-known/…`, `/register`, `/authorize`, `/token`, `/revoke`, `/oauth/…`, `/clients`), so a reverse proxy must pass those paths to the server, not only the MCP path (see the nginx example in [Put it behind HTTPS](#4-put-it-behind-https)). If `ALLOWED_HOSTS` is set, it must include the host of `MCP_PUBLIC_URL`; the server refuses to start otherwise. Only hashes of tokens are stored, in `DATA_DIR/oauth-state.json`; a copy of that file can't be used to call the server. Registered clients are always treated as public clients (PKCE protects the code exchange), so no client secret is stored either.
 
 ### Rotating credentials
 
@@ -558,7 +565,7 @@ Off by default. Set `MCP_AUTH_AUTO_EXPIRE=true` to make tokens expire, so a forg
 3. Check that a tool call works, e.g. `list_sites`.
 4. Delete the old key in the Cloud console. If you're in a Google Cloud organization, the `iam.serviceAccountKeyExpiryHours` policy can make keys expire on their own.
 
-**An extra layer (optional).** Behind Cloudflare, a [Cloudflare Access service token](https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/) or a WAF rule limited to your clients' IP addresses means a leaked bearer token alone isn't enough. With OAuth sign-in, leave the sign-in paths listed in [OAuth sign-in](#oauth-sign-in) reachable from your browser.
+**An extra layer (optional).** Behind Cloudflare, a [Cloudflare Access service token](https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/) or a WAF rule limited to your clients' IP addresses means a leaked bearer token alone isn't enough. With OAuth sign-in, leave the paths listed in [OAuth sign-in](#oauth-sign-in) open: your browser uses `/authorize`, `/oauth/…` and `/clients`, and the clients themselves call `/.well-known/…`, `/register`, `/token` and `/revoke`, so an IP rule must allow both, and a service token in front of them breaks OAuth clients.
 
 ## Updating
 

@@ -143,6 +143,12 @@ describe('OAuth settings', () => {
     expect(() => loadConfig(noToken)).toThrow(/set MCP_AUTH_TOKEN or MCP_AUTH_TOKENS/);
   });
 
+  it('requires the public host in ALLOWED_HOSTS when both are set', () => {
+    expect(() => loadConfig({ ...base, ...oauthEnv, ALLOWED_HOSTS: 'other.example' })).toThrow(/^\s+ALLOWED_HOSTS: must include saturn\.brylex-it\.dev/m);
+    expect(loadConfig({ ...base, ...oauthEnv, ALLOWED_HOSTS: 'other.example,SATURN.brylex-it.dev:443' }).oauth).toBeDefined();
+    expect(loadConfig({ ...base, ...oauthEnv }).oauth).toBeDefined();
+  });
+
   it('parses TRUST_PROXY', () => {
     expect(loadConfig(base).TRUST_PROXY).toBeUndefined();
     expect(loadConfig({ ...base, TRUST_PROXY: '' }).TRUST_PROXY).toBeUndefined();

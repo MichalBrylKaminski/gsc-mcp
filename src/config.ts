@@ -194,6 +194,13 @@ const ConfigSchema = z.object({
       message: `with auto-expire on, every token needs an expiry date (name:token:YYYY-MM-DD); missing for ${undated.join(', ')}. Create dated tokens with \`node dist/issueToken.js <name>\``,
     });
   }
+  if (oauth && c.ALLOWED_HOSTS?.length && !c.ALLOWED_HOSTS.includes(oauth.publicUrl.hostname)) {
+    ctx.addIssue({
+      code: 'custom',
+      path: ['ALLOWED_HOSTS'],
+      message: `must include ${oauth.publicUrl.hostname}, the host of MCP_PUBLIC_URL, or OAuth sign-in would be refused`,
+    });
+  }
   return { ...c, authTokens: tokens, oauth };
 });
 
