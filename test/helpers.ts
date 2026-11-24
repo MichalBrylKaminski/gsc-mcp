@@ -56,8 +56,9 @@ export function tokenRegistry(tokens: AuthToken[], opts: Partial<TokenRegistryOp
 
 /**
  * Google stand-in: authUrl records state and nonce; verify returns the queued
- * identity with the nonce of the most recent sign-in, so tests must finish one
- * sign-in before starting the next.
+ * identity with the nonce Google would put in its ID token. Pass the sign-in's
+ * state as the `code` to pick that sign-in; any other code means the most
+ * recent sign-in.
  */
 export function fakeGoogle() {
   const issued: { state: string; nonce: string }[] = [];
@@ -67,9 +68,10 @@ export function fakeGoogle() {
       issued.push({ state, nonce });
       return `https://google.test/auth?state=${encodeURIComponent(state)}&nonce=${encodeURIComponent(nonce)}`;
     },
-    async verify() {
+    async verify(code) {
       if (next instanceof Error) throw next;
-      return { email: 'owner@example.com', emailVerified: true, nonce: issued.at(-1)?.nonce, ...next };
+      const nonce = (issued.find((i) => i.state === code) ?? issued.at(-1))?.nonce;
+      return { email: 'owner@example.com', emailVerified: true, nonce, ...next };
     },
   };
   return { google, issued, setNext: (n: Partial<GoogleIdentity> | Error) => (next = n), lastState: () => issued.at(-1)!.state };
@@ -79,7 +81,7 @@ export function fakeGoogle() {
 export const TOKEN = 'test-token-0123456789abcdef0123456789abcdef';
 
 /** An app on a real port with OAuth on, whose issuer is its own address. */
-export async function startOAuthApp(opts: { allowedEmails?: string[]; logger?: Logger } = {}) {
+export async function startOAuthApp(opts: { allowedEmails?: string[]; logger?: Logger; allowedHosts?: string[]; trustProxy?: number } = {}) {
   const g = fakeGoogle();
   const server = createServer();
   server.listen(0, '127.0.0.1');
@@ -92,6 +94,8 @@ export async function startOAuthApp(opts: { allowedEmails?: string[]; logger?: L
   const app = createApp({
     tokens,
     mcpPath: '/gsc-mcp',
+    allowedHosts: opts.allowedHosts,
+    trustProxy: opts.trustProxy,
     oauth: {
       store,
       resourceMetadataUrl: resourceMetadataUrl(publicUrl, '/gsc-mcp'),
@@ -101,7 +105,7 @@ export async function startOAuthApp(opts: { allowedEmails?: string[]; logger?: L
     logger: opts.logger ?? silentLogger,
   });
   server.on('request', app);
-  return { base, g, store, provider, close: () => new Promise((r) => server.close(r)) };
+  return { app, base, g, store, provider, close: () => new Promise((r) => server.close(r)) };
 }
 
 export const pkce = () => {

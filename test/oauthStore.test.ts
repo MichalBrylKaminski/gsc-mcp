@@ -161,10 +161,35 @@ describe('OAuthStore clients', () => {
     expect(store.getClient('client-1')).toBeUndefined();
   });
 
-  it('refuses registrations beyond 100 clients', () => {
+  it('makes room at 100 clients by forgetting the oldest one without a grant', () => {
     const store = new OAuthStore({ file, ttlDays: 90, logger: silentLogger });
-    for (let i = 0; i < 100; i++) store.registerClient({ client_id: `c${i}`, redirect_uris: ['https://x/cb'] } as never);
+    for (let i = 0; i < 100; i++) {
+      vi.setSystemTime(new Date(Date.parse(NOW) + i * 1000));
+      store.registerClient({ client_id: `c${i}`, redirect_uris: ['https://x/cb'] } as never);
+    }
+    store.createGrant({ clientId: 'c0', clientName: 'kept', email: 'o@x.dev', redirectHost: 'x' });
+    store.registerClient({ client_id: 'c100', redirect_uris: ['https://x/cb'] } as never);
+    expect(store.getClient('c0')).toBeDefined(); // has a grant
+    expect(store.getClient('c1')).toBeUndefined(); // oldest without one
+    expect(store.getClient('c100')).toBeDefined();
+  });
+
+  it('refuses a registration only when every client has a grant', () => {
+    const store = new OAuthStore({ file, ttlDays: 90, logger: silentLogger });
+    for (let i = 0; i < 100; i++) {
+      store.registerClient({ client_id: `c${i}`, redirect_uris: ['https://x/cb'] } as never);
+      store.createGrant({ clientId: `c${i}`, clientName: 'x', email: 'o@x.dev', redirectHost: 'x' });
+    }
     expect(() => store.registerClient({ client_id: 'c100', redirect_uris: ['https://x/cb'] } as never)).toThrow(InvalidClientMetadataError);
+  });
+
+  it('keeps only the latest 100 used refresh tokens per grant', () => {
+    const { store, client, grant } = setup();
+    let t = store.issueTokens(grant.id);
+    const first = t.refresh_token;
+    for (let i = 0; i < 101; i++) t = store.refresh(client.client_id, t.refresh_token);
+    expect(() => store.refresh(client.client_id, first)).toThrow(InvalidGrantError); // too old to be recognised as reuse...
+    expect(store.grants()).toHaveLength(1); // ...so the grant stays
   });
 
   it('frees a slot by pruning once the limit is reached', () => {

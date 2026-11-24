@@ -148,7 +148,11 @@ describe('GscOAuthProvider', () => {
     p.g.setNext({ nonce: 'other' });
     expect((await toConsent(p)).ret).toMatchObject({ kind: 'error', status: 400 });
     p.g.setNext(new Error('invalid_grant'));
-    expect((await toConsent(p)).ret).toMatchObject({ kind: 'error', status: 400 });
+    const { ret } = await toConsent(p);
+    expect(ret.kind).toBe('redirect');
+    const url = new URL((ret as { url: string }).url);
+    expect(url.searchParams.get('error')).toBe('temporarily_unavailable');
+    expect(url.searchParams.get('state')).toBe('client-state');
   });
 
   it('rejects a wrong csrf but keeps the consent usable', async () => {
@@ -268,15 +272,22 @@ describe('GscOAuthProvider', () => {
     expect(logged).toContain('Invalid token signature');
   });
 
-  it('signs in for the clients page', async () => {
+  it('signs in for the clients page, bound to the caller\'s binding', async () => {
     const p = setup();
-    expect(p.provider.startSessionSignIn()).toMatch(/^https:\/\/google\.test\//);
-    expect(await p.provider.handleGoogleReturn({ state: p.g.lastState(), code: 'c' })).toEqual({ kind: 'session', email: 'owner@example.com' });
+    const s = p.provider.startSessionSignIn();
+    expect(s.url).toMatch(/^https:\/\/google\.test\//);
+    expect(s.binding).toBe(`${p.g.lastState()}.${p.g.issued.at(-1)!.nonce}`);
+    expect(await p.provider.handleGoogleReturn({ state: p.g.lastState(), code: 'c' })).toMatchObject({ kind: 'error', status: 400 });
+    expect(await p.provider.handleGoogleReturn({ state: 'other', code: 'c' }, s.binding)).toMatchObject({ kind: 'error', status: 400 });
+    expect(await p.provider.handleGoogleReturn({ state: p.g.lastState(), code: 'c' }, s.binding)).toEqual({ kind: 'session', email: 'owner@example.com' });
 
     p.g.setNext({ email: 'intruder@example.com' });
-    p.provider.startSessionSignIn();
-    expect(await p.provider.handleGoogleReturn({ state: p.g.lastState(), code: 'c' })).toMatchObject({ kind: 'error', status: 403 });
-    p.provider.startSessionSignIn();
-    expect(await p.provider.handleGoogleReturn({ state: p.g.lastState(), error: 'access_denied' })).toMatchObject({ kind: 'error', status: 403 });
+    const s2 = p.provider.startSessionSignIn();
+    expect(await p.provider.handleGoogleReturn({ state: p.g.lastState(), code: 'c' }, s2.binding)).toMatchObject({ kind: 'error', status: 403 });
+    const s3 = p.provider.startSessionSignIn();
+    expect(await p.provider.handleGoogleReturn({ state: p.g.lastState(), error: 'access_denied' }, s3.binding)).toMatchObject({ kind: 'error', status: 403 });
+    p.g.setNext(new Error('Google is down'));
+    const s4 = p.provider.startSessionSignIn();
+    expect(await p.provider.handleGoogleReturn({ state: p.g.lastState(), code: 'c' }, s4.binding)).toMatchObject({ kind: 'error', status: 502 });
   });
 });

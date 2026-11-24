@@ -65,10 +65,10 @@ Deny or a disallowed email: redirect to the client's `redirect_uri` with `error=
 
 `DATA_DIR/oauth-state.json`, written with the existing atomic `JsonFile`:
 
-- registered clients, grants, and token hashes only (never a token itself), plus the hashes of used refresh tokens until their grant expires;
+- registered clients, grants, and token hashes only (never a token itself), plus the hashes of the grant's last 100 used refresh tokens, for reuse detection;
 - written on every change to clients, grants or tokens, without waiting for the write: if the process crashes in the instant between issuing a new pair and saving, the previous refresh token works once more after the restart (accepted);
 - entries that fail validation on load are dropped with a warning; client secrets are never stored, because every registered client is made public (`token_endpoint_auth_method: none`, PKCE required), and only the client fields the server uses are kept; `lastUsedAt` is updated in memory and flushed at most once a minute and at shutdown;
-- registration clean-up: a client with no grant is deleted 24 hours after registering; at most 100 registered clients (further registrations are refused with an error);
+- registration clean-up: a client with no grant is deleted 24 hours after registering; at most 100 registered clients: when full, the oldest client without a grant is forgotten (registration grants nothing, so this is safe), and a registration is refused only when every client has a grant;
 - expired grants are deleted on startup and once a day;
 - a file that can't be read or parsed on startup is renamed to `oauth-state.json.corrupt-<timestamp>`, an error is logged, and the server starts with no grants (every client signs in again).
 
@@ -81,6 +81,8 @@ The client name comes from registration and is chosen by the client: it is cut t
 ## Connected clients page
 
 - `GET /clients`: if there is no session, redirects through Google sign-in (same allowlist), then sets a session cookie (`__Host-gsc_mcp_session`): random id, kept in server memory, 12 hours, `HttpOnly; Secure; SameSite=Lax; Path=/`.
+- The sign-in for this page keeps nothing on the server: `GET /clients` puts its Google `state` and nonce in a 5-minute `__Host-gsc_mcp_signin` cookie (`HttpOnly; Secure; SameSite=Lax`), and the callback accepts the state only from the browser holding that cookie. Anonymous `GET /clients` requests therefore can't push out the owner's sign-in or fill the queue client sign-ins use.
+- `/oauth/google/callback` (which may call Google) is limited to 30 requests per 10 minutes per client address.
 - Lists each grant: client name, redirect host, approved on, expires on, last used. Lists fixed tokens read-only: name and expiry (or "never").
 - `POST /clients/revoke` (one grant) and `POST /clients/revoke-all`, each with the session's CSRF token. `POST /clients/sign-out` ends the session.
 
@@ -115,6 +117,8 @@ Other changes:
 | Grant expired | refresh returns `invalid_grant`; the client starts a new sign-in |
 | Refresh token reused | grant revoked, `invalid_grant`, error logged |
 | Pending sign-in lost (timeout or restart) | error page asking to start the connection again |
+| Google's code exchange fails (Google down, or a made-up code) | client sign-in: `error=temporarily_unavailable` to the client's `redirect_uri`; clients page: a 502 page |
+| Too many callbacks from one address | 429 page |
 | `oauth-state.json` unreadable | renamed aside, error logged, start empty |
 
 ## Testing

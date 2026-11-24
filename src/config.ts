@@ -112,6 +112,9 @@ export interface OAuthConfig {
   allowedEmails: string[];
 }
 
+/** Paths the OAuth endpoints and pages use at the root of the domain. */
+const OAUTH_PATHS = ['/.well-known', '/register', '/authorize', '/token', '/revoke', '/oauth', '/clients'];
+
 const OAUTH_VARIABLES = ['MCP_PUBLIC_URL', 'GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_SECRET', 'MCP_OAUTH_ALLOWED_EMAILS'] as const;
 
 /** An origin the SDK accepts as an OAuth issuer: https, or http on localhost; no path, query or fragment. */
@@ -193,6 +196,10 @@ const ConfigSchema = z.object({
       path: ['MCP_AUTH_AUTO_EXPIRE'],
       message: `with auto-expire on, every token needs an expiry date (name:token:YYYY-MM-DD); missing for ${undated.join(', ')}. Create dated tokens with \`node dist/issueToken.js <name>\``,
     });
+  }
+  const taken = OAUTH_PATHS.find((p) => c.MCP_PATH === p || c.MCP_PATH.startsWith(`${p}/`));
+  if (oauth && taken) {
+    ctx.addIssue({ code: 'custom', path: ['MCP_PATH'], message: `cannot be ${c.MCP_PATH} with OAuth sign-in on, because ${taken} is an OAuth path` });
   }
   if (oauth && c.ALLOWED_HOSTS?.length && !c.ALLOWED_HOSTS.includes(oauth.publicUrl.hostname)) {
     ctx.addIssue({

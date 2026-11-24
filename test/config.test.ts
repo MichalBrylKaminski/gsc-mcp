@@ -149,6 +149,14 @@ describe('OAuth settings', () => {
     expect(loadConfig({ ...base, ...oauthEnv }).oauth).toBeDefined();
   });
 
+  it('keeps MCP_PATH off the OAuth paths when OAuth is on', () => {
+    for (const bad of ['/token', '/register', '/clients', '/oauth', '/oauth/x', '/.well-known']) {
+      expect(() => loadConfig({ ...base, ...oauthEnv, MCP_PATH: bad }), bad).toThrow(/^\s+MCP_PATH: cannot be/m);
+      expect(loadConfig({ ...base, MCP_PATH: bad }).MCP_PATH).toBe(bad); // fine without OAuth
+    }
+    expect(loadConfig({ ...base, ...oauthEnv, MCP_PATH: '/tokens' }).MCP_PATH).toBe('/tokens');
+  });
+
   it('parses TRUST_PROXY', () => {
     expect(loadConfig(base).TRUST_PROXY).toBeUndefined();
     expect(loadConfig({ ...base, TRUST_PROXY: '' }).TRUST_PROXY).toBeUndefined();

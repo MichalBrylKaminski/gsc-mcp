@@ -1,14 +1,16 @@
-import { randomBytes, timingSafeEqual } from 'node:crypto';
 import express, { type Request, type Response } from 'express';
 import type { ClientInfo } from '../auth.js';
 import type { Logger } from '../logger.js';
 import { errorPage, escapeHtml, page, sendPage } from './pages.js';
 import type { GscOAuthProvider } from './provider.js';
-import type { GrantView, OAuthStore } from './store.js';
+import { randomSecret as random, sameSecret } from './secrets.js';
+import { grantLabel, type GrantView, type OAuthStore } from './store.js';
 
 export const SESSION_TTL_MS = 43_200_000;
 /** The __Host- prefix makes browsers refuse this cookie from any other host, e.g. a sibling subdomain. */
 export const SESSION_COOKIE = '__Host-gsc_mcp_session';
+/** Holds a clients-page sign-in's state and nonce between GET /clients and Google's redirect back. */
+export const SIGNIN_COOKIE = '__Host-gsc_mcp_signin';
 /** Owner sessions are few; the cap only stops a runaway loop from growing memory. */
 const MAX_SESSIONS = 100;
 
@@ -18,7 +20,6 @@ export interface Session {
   expiresAt: number;
 }
 
-const random = () => randomBytes(32).toString('base64url');
 
 /** Sessions for the Connected clients page, in memory only: a restart signs the owner out. */
 export class OwnerSessions {
@@ -59,6 +60,9 @@ export function readCookie(header: string | undefined, name: string): string | u
 
 export const sessionCookie = (id: string) => `${SESSION_COOKIE}=${id}; Path=/; Max-Age=${SESSION_TTL_MS / 1000}; HttpOnly; Secure; SameSite=Lax`;
 const clearedCookie = `${SESSION_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`;
+/** Lax, so the browser sends it on Google's top-level redirect back to us. */
+export const signInCookie = (binding: string) => `${SIGNIN_COOKIE}=${binding}; Path=/; Max-Age=300; HttpOnly; Secure; SameSite=Lax`;
+export const clearedSignInCookie = `${SIGNIN_COOKIE}=; Path=/; Max-Age=0; HttpOnly; Secure; SameSite=Lax`;
 
 const day = (iso: string | undefined) => (iso ? iso.slice(0, 10) : 'never');
 const when = (iso: string | undefined) => (iso ? `${iso.slice(0, 16).replace('T', ' ')} UTC` : 'never');
@@ -98,12 +102,6 @@ export function clientsPage(v: { email: string; csrf: string; grants: GrantView[
   );
 }
 
-function sameSecret(a: string, b: string): boolean {
-  const x = Buffer.from(a);
-  const y = Buffer.from(b);
-  return x.length === y.length && timingSafeEqual(x, y);
-}
-
 export interface ClientsRoutesOptions {
   provider: GscOAuthProvider;
   store: OAuthStore;
@@ -122,7 +120,10 @@ export function clientsRoutes(o: ClientsRoutesOptions): express.Router {
 
   router.get('/clients', (req, res) => {
     const { session } = sessionOf(req);
-    if (!session) return void res.set('Cache-Control', 'no-store').redirect(302, o.provider.startSessionSignIn());
+    if (!session) {
+      const signIn = o.provider.startSessionSignIn();
+      return void res.set({ 'Cache-Control': 'no-store', 'Set-Cookie': signInCookie(signIn.binding) }).redirect(302, signIn.url);
+    }
     sendPage(res, 200, clientsPage({ email: session.email, csrf: session.csrf, grants: o.store.grants(), fixed: o.fixedClients() }));
   });
 
@@ -144,7 +145,7 @@ export function clientsRoutes(o: ClientsRoutesOptions): express.Router {
     const grantId = typeof body.grantId === 'string' ? body.grantId : '';
     const grant = o.store.grants().find((g) => g.id === grantId);
     if (grant && o.store.revokeGrant(grantId)) {
-      o.logger.info('grant revoked', { client: `oauth:${grant.clientName}#${grant.id.slice(0, 6)}`, by: session.email });
+      o.logger.info('grant revoked', { client: grantLabel(grant), by: session.email });
     }
   });
   post('/clients/revoke-all', (_body, session) => {

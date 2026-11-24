@@ -20,15 +20,28 @@ describe('Connected clients page', () => {
     app.g.setNext({ email: 'owner@example.com', emailVerified: true });
   });
 
-  /** Signs in through the fake Google; returns the session cookie and the page's csrf. */
-  async function signIn() {
+  /** GET /clients without a session: returns the sign-in cookie it sets and the Google state. */
+  async function startSignIn() {
     const start = await fetch(`${app.base}/clients`, { redirect: 'manual' });
     expect(start.status).toBe(302);
     expect(start.headers.get('location')).toMatch(/^https:\/\/google\.test\/auth\?state=/);
-    const back = await fetch(`${app.base}/oauth/google/callback?state=${encodeURIComponent(app.g.lastState())}&code=c`, { redirect: 'manual' });
+    const set = start.headers.getSetCookie();
+    expect(set).toHaveLength(1);
+    expect(set[0]).toMatch(/^__Host-gsc_mcp_signin=[\w-]{40,}\.[\w-]{40,}; Path=\/; Max-Age=300; HttpOnly; Secure; SameSite=Lax$/);
+    return { signin: set[0]!.split(';')[0]!, state: app.g.lastState() };
+  }
+  const callback = (state: string, cookie?: string) =>
+    fetch(`${app.base}/oauth/google/callback?state=${encodeURIComponent(state)}&code=${encodeURIComponent(state)}`, { headers: cookie ? { cookie } : {}, redirect: 'manual' });
+
+  /** Signs in through the fake Google; returns the session cookie and the page's csrf. */
+  async function signIn() {
+    const { signin, state } = await startSignIn();
+    const back = await callback(state, signin);
     expect(back.status).toBe(302);
     expect(back.headers.get('location')).toBe('/clients');
-    const setCookie = back.headers.get('set-cookie')!;
+    const set = back.headers.getSetCookie();
+    expect(set).toContainEqual(expect.stringMatching(/^__Host-gsc_mcp_signin=; Path=\/; Max-Age=0/));
+    const setCookie = set.find((c) => c.startsWith('__Host-gsc_mcp_session='))!;
     expect(setCookie).toMatch(/^__Host-gsc_mcp_session=[\w-]{40,}; Path=\/; Max-Age=43200; HttpOnly; Secure; SameSite=Lax$/);
     const cookie = setCookie.split(';')[0]!;
     const list = await fetch(`${app.base}/clients`, { headers: { cookie }, redirect: 'manual' });
@@ -60,11 +73,19 @@ describe('Connected clients page', () => {
   });
 
   it('refuses a disallowed account', async () => {
-    await fetch(`${app.base}/clients`, { redirect: 'manual' });
+    const { signin, state } = await startSignIn();
     app.g.setNext({ email: 'intruder@example.com' });
-    const back = await fetch(`${app.base}/oauth/google/callback?state=${encodeURIComponent(app.g.lastState())}&code=c`, { redirect: 'manual' });
+    const back = await callback(state, signin);
     expect(back.status).toBe(403);
-    expect(back.headers.get('set-cookie')).toBeNull();
+    expect(back.headers.getSetCookie().some((c) => c.startsWith('__Host-gsc_mcp_session='))).toBe(false);
+  });
+
+  it('binds the sign-in to the browser that started it', async () => {
+    const { signin, state } = await startSignIn();
+    expect((await callback(state)).status).toBe(400); // no cookie
+    const other = await startSignIn();
+    expect((await callback(state, other.signin)).status).toBe(400); // another browser's cookie
+    expect((await callback(state, signin)).status).toBe(302);
   });
 
   it('revokes one grant', async () => {
@@ -168,13 +189,14 @@ describe('Connected clients page', () => {
 
   it('ends the previous session on a new sign-in', async () => {
     const first = await signIn();
-    await fetch(`${app.base}/clients`, { redirect: 'manual' });
-    const back = await fetch(`${app.base}/oauth/google/callback?state=${encodeURIComponent(app.g.lastState())}&code=c`, { headers: { cookie: first.cookie }, redirect: 'manual' });
+    const { signin, state } = await startSignIn();
+    const back = await callback(state, `${first.cookie}; ${signin}`);
     expect(back.status).toBe(302);
     expect((await fetch(`${app.base}/clients`, { headers: { cookie: first.cookie }, redirect: 'manual' })).status).toBe(302);
   });
 
-  it('never lets clients-page sign-ins block client sign-ins', async () => {
+  it('never lets clients-page sign-ins block client sign-ins or the owner', async () => {
+    const owner = await startSignIn();
     for (let i = 0; i < 1100; i++) await fetch(`${app.base}/clients`, { redirect: 'manual' });
     const reg = (await (
       await fetch(`${app.base}/register`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ redirect_uris: ['http://127.0.0.1:9/cb'], token_endpoint_auth_method: 'none' }) })
@@ -184,10 +206,8 @@ describe('Connected clients page', () => {
     const res = await fetch(authorize, { redirect: 'manual' });
     expect(res.status).toBe(302);
     expect(res.headers.get('location')).toMatch(/^https:\/\/google\.test\//);
-    // The newest clients-page sign-in still works.
-    await fetch(`${app.base}/clients`, { redirect: 'manual' });
-    const back = await fetch(`${app.base}/oauth/google/callback?state=${encodeURIComponent(app.g.lastState())}&code=c`, { redirect: 'manual' });
-    expect(back.headers.get('location')).toBe('/clients');
+    // The owner's sign-in, started before the flood, still works: nothing about it is kept on the server.
+    expect((await callback(owner.state, owner.signin)).headers.get('location')).toBe('/clients');
   });
 
   it('serves the page with no-store and no framing', async () => {

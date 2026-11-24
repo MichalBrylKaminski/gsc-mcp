@@ -251,6 +251,15 @@ describe('OAuth flow', () => {
     expect(await bad.json()).toMatchObject({ error: 'invalid_grant' });
   });
 
+  it('rejects a code exchange with a different redirect_uri', async () => {
+    const c = await toConsentPage(app.base, app.g);
+    const approved = await fetch(`${app.base}/oauth/consent`, form({ consentId: c.consentId!, csrf: c.csrf!, decision: 'approve' }));
+    const code = new URL(approved.headers.get('location')!).searchParams.get('code')!;
+    const bad = await fetch(`${app.base}/token`, form({ grant_type: 'authorization_code', code, code_verifier: c.verifier, client_id: c.clientId, redirect_uri: 'http://127.0.0.1:9/other' }));
+    expect(bad.status).toBe(400);
+    expect(await bad.json()).toMatchObject({ error: 'invalid_grant' });
+  });
+
   it('lets a client revoke its token', async () => {
     const c = await toConsentPage(app.base, app.g);
     const approved = await fetch(`${app.base}/oauth/consent`, form({ consentId: c.consentId!, csrf: c.csrf!, decision: 'approve' }));
@@ -260,5 +269,56 @@ describe('OAuth flow', () => {
     expect(revoked.status).toBe(200);
     const after = await fetch(`${app.base}/gsc-mcp`, { method: 'POST', headers: { authorization: `Bearer ${t.access_token}`, 'content-type': 'application/json' }, body: '{}' });
     expect(after.status).toBe(401);
+  });
+});
+
+describe('OAuth mounting', () => {
+  it('serves no OAuth routes when OAuth is off', async () => {
+    const app = createApp({ tokens: tokenRegistry([{ label: 'test', token: TOKEN }]), deps: { service: makeService(fakeApi()), logger: silentLogger, maxRowsPerCall: 25_000 }, logger: silentLogger });
+    const server = app.listen(0, '127.0.0.1');
+    await new Promise((r) => server.once('listening', r));
+    const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+    try {
+      for (const path of ['/.well-known/oauth-authorization-server', '/.well-known/oauth-protected-resource/mcp', '/authorize', '/clients', '/oauth/google/callback']) {
+        expect((await fetch(`${base}${path}`)).status, path).toBe(404);
+      }
+      for (const path of ['/register', '/token', '/revoke', '/oauth/consent']) {
+        expect((await fetch(`${base}${path}`, { method: 'POST' })).status, path).toBe(404);
+      }
+    } finally {
+      await new Promise((r) => server.close(r));
+    }
+  });
+
+  it('applies ALLOWED_HOSTS to the OAuth routes', async () => {
+    const app = await startOAuthApp({ allowedHosts: ['gsc.example'] });
+    try {
+      expect((await fetch(`${app.base}/.well-known/oauth-authorization-server`)).status).toBe(403);
+      expect((await fetch(`${app.base}/clients`, { redirect: 'manual' })).status).toBe(403);
+      expect((await fetch(`${app.base}/healthz`)).status).toBe(200);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('passes TRUST_PROXY to Express', async () => {
+    const app = await startOAuthApp({ trustProxy: 2 });
+    try {
+      expect(app.app.get('trust proxy')).toBe(2);
+    } finally {
+      await app.close();
+    }
+  });
+
+  it('limits Google callbacks per address', async () => {
+    const app = await startOAuthApp({ trustProxy: 1 });
+    try {
+      const hit = (ip: string) => fetch(`${app.base}/oauth/google/callback?state=bogus&code=c`, { headers: { 'x-forwarded-for': ip } });
+      for (let i = 0; i < 30; i++) expect((await hit('203.0.113.7')).status).toBe(400);
+      expect((await hit('203.0.113.7')).status).toBe(429);
+      expect((await hit('198.51.100.1')).status).toBe(400);
+    } finally {
+      await app.close();
+    }
   });
 });

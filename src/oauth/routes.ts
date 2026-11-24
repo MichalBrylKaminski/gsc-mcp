@@ -2,9 +2,10 @@ import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from '@modelconte
 import express, { type NextFunction, type Request, type Response } from 'express';
 import type { ClientInfo } from '../auth.js';
 import type { Logger } from '../logger.js';
-import { clientsRoutes, OwnerSessions, readCookie, SESSION_COOKIE, sessionCookie } from './clients.js';
+import { clearedSignInCookie, clientsRoutes, OwnerSessions, readCookie, SESSION_COOKIE, sessionCookie, SIGNIN_COOKIE } from './clients.js';
 import { consentPage, errorPage, sendPage } from './pages.js';
 import { safeReason, type GscOAuthProvider } from './provider.js';
+import { RateLimit } from './rateLimit.js';
 import type { OAuthStore } from './store.js';
 
 export interface OAuthRouterOptions {
@@ -23,6 +24,9 @@ export function resourceMetadataUrl(publicUrl: URL, mcpPath: string): string {
   return getOAuthProtectedResourceMetadataUrl(new URL(mcpPath, publicUrl));
 }
 
+const CALLBACK_LIMIT = 30;
+const CALLBACK_WINDOW_MS = 600_000;
+
 const str = (v: unknown) => (typeof v === 'string' ? v : undefined);
 
 /**
@@ -33,6 +37,8 @@ const str = (v: unknown) => (typeof v === 'string' ? v : undefined);
 export function oauthRouter(o: OAuthRouterOptions): express.Router {
   const router = express.Router();
   const sessions = new OwnerSessions();
+  // Each callback may cost a request to Google; real sign-ins need a handful.
+  const callbacks = new RateLimit(CALLBACK_LIMIT, CALLBACK_WINDOW_MS);
   router.use(
     mcpAuthRouter({
       provider: o.provider,
@@ -43,9 +49,12 @@ export function oauthRouter(o: OAuthRouterOptions): express.Router {
   );
 
   router.get('/oauth/google/callback', async (req, res) => {
+    if (!callbacks.take(req.ip ?? 'unknown')) return sendPage(res, 429, errorPage('Too many sign-in attempts from this address. Wait ten minutes and try again.'));
+    const binding = readCookie(req.headers.cookie, SIGNIN_COOKIE);
+    if (binding) res.append('Set-Cookie', clearedSignInCookie); // single use
     let ret;
     try {
-      ret = await o.provider.handleGoogleReturn({ state: str(req.query.state), code: str(req.query.code), error: str(req.query.error) });
+      ret = await o.provider.handleGoogleReturn({ state: str(req.query.state), code: str(req.query.code), error: str(req.query.error) }, binding);
     } catch (err) {
       o.logger.error('sign-in callback failed', { error: safeReason(err) });
       return sendPage(res, 500, errorPage('Sign-in failed. Start the connection again from your client.'));
@@ -58,7 +67,7 @@ export function oauthRouter(o: OAuthRouterOptions): express.Router {
       case 'session':
         sessions.delete(readCookie(req.headers.cookie, SESSION_COOKIE)); // a new sign-in ends the previous session
         o.logger.info('owner signed in to the clients page', { email: ret.email });
-        return void res.set({ 'Cache-Control': 'no-store', 'Set-Cookie': sessionCookie(sessions.create(ret.email)) }).redirect(302, '/clients');
+        return void res.set('Cache-Control', 'no-store').append('Set-Cookie', sessionCookie(sessions.create(ret.email))).redirect(302, '/clients');
       case 'error':
         return sendPage(res, ret.status, errorPage(ret.message));
     }

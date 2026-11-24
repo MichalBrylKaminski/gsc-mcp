@@ -4,6 +4,7 @@ import { InvalidClientMetadataError, InvalidGrantError } from '@modelcontextprot
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 import { DAY_MS, EXPIRY_WARNING_DAYS, expiryDayFor, expiryMs, utcDay, type ClientInfo } from '../auth.js';
 import { JsonFile } from '../limits/limiter.js';
+import { randomSecret } from './secrets.js';
 import type { Logger } from '../logger.js';
 
 export const ACCESS_TOKEN_TTL_MS = 3_600_000;
@@ -14,6 +15,7 @@ export const MAX_CLIENTS = 100;
 export const LAST_USED_FLUSH_MS = 60_000;
 export const CLIENT_NAME_MAX = 64;
 const MAX_REDIRECT_URIS = 10;
+const MAX_USED_REFRESH_HASHES = 100;
 const MAX_METADATA_STRING = 2048;
 
 /** What the Connected clients page and logs may know about a grant. */
@@ -68,7 +70,7 @@ export interface OAuthStoreOptions {
 }
 
 const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
-const newToken = () => randomBytes(32).toString('base64url');
+const newToken = randomSecret;
 const iso = (ms: number) => new Date(ms).toISOString();
 
 const isStr = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
@@ -93,6 +95,9 @@ function validGrant(g: unknown): g is StoredGrant {
     x.usedRefreshHashes.every(isStr)
   );
 }
+
+/** How a grant appears in logs and as ClientInfo.name: oauth:<client name>#<first 6 chars of the grant id>. */
+export const grantLabel = (g: { clientName: string; id: string }) => `oauth:${g.clientName}#${g.id.slice(0, 6)}`;
 
 /** A client-chosen name, safe to show and log: no control or format characters, at most 64 characters. */
 export function cleanClientName(name: string | undefined): string {
@@ -190,7 +195,13 @@ export class OAuthStore {
    */
   registerClient(info: Omit<OAuthClientInformationFull, 'client_id' | 'client_id_issued_at'>): OAuthClientInformationFull {
     if (this.clients.size >= MAX_CLIENTS) this.prune();
-    if (this.clients.size >= MAX_CLIENTS) throw new InvalidClientMetadataError('This server has too many registered clients; try again tomorrow.');
+    if (this.clients.size >= MAX_CLIENTS) {
+      // Registering grants nothing, so making room by forgetting the oldest client without a grant is safe.
+      const inUse = new Set([...this.grantsById.values()].map((g) => g.clientId));
+      const oldest = [...this.clients.values()].filter((c) => !inUse.has(c.client_id)).sort((a, b) => a.registeredAt - b.registeredAt)[0];
+      if (!oldest) throw new InvalidClientMetadataError('This server has too many connected clients; revoke one on the Connected clients page first.');
+      this.clients.delete(oldest.client_id);
+    }
     const given = info as Partial<OAuthClientInformationFull>;
     const uris = given.redirect_uris ?? [];
     if (!uris.length || uris.length > MAX_REDIRECT_URIS || uris.some((u) => typeof u !== 'string' || u.length > MAX_METADATA_STRING)) {
@@ -275,6 +286,8 @@ export class OAuthStore {
     }
     g.usedRefreshHashes.push(hash);
     this.byUsedRefresh.set(hash, g);
+    // Keep the most recent ones; an older copied token is still useless, just not detected as reuse.
+    while (g.usedRefreshHashes.length > MAX_USED_REFRESH_HASHES) this.byUsedRefresh.delete(g.usedRefreshHashes.shift()!);
     return this.rotate(g);
   }
 
@@ -360,7 +373,7 @@ export class OAuthStore {
   }
 
   private label(g: StoredGrant): string {
-    return `oauth:${g.clientName}#${g.id.slice(0, 6)}`;
+    return grantLabel(g);
   }
 
   private view(g: StoredGrant): GrantView {
