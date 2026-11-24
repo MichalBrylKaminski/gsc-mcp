@@ -1,4 +1,5 @@
 /** Server-rendered pages for sign-in: plain HTML, inline CSS, no scripts. Every value is escaped. */
+import type { Response } from 'express';
 
 const ESCAPES: Record<string, string> = { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' };
 
@@ -48,4 +49,23 @@ export function consentPage(c: { consentId: string; csrf: string; clientName: st
       </form>
     </div>`,
   );
+}
+
+/**
+ * Headers for every page: never cached, no scripts, never framed (so the
+ * consent buttons can't be clickjacked). No form-action: browsers apply it to
+ * the redirect after the consent form, which goes to the client's own URI.
+ */
+export function sendPage(res: Response, status: number, html: string): void {
+  res
+    .status(status)
+    .set({
+      'Cache-Control': 'no-store',
+      'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
+      'X-Frame-Options': 'DENY',
+      'Referrer-Policy': 'no-referrer',
+      'X-Content-Type-Options': 'nosniff',
+    })
+    .type('html')
+    .send(html);
 }

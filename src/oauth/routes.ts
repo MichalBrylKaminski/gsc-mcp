@@ -1,9 +1,10 @@
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from '@modelcontextprotocol/sdk/server/auth/router.js';
-import express, { type Response } from 'express';
+import express, { type NextFunction, type Request, type Response } from 'express';
 import type { ClientInfo } from '../auth.js';
 import type { Logger } from '../logger.js';
-import { consentPage, errorPage } from './pages.js';
-import type { GscOAuthProvider } from './provider.js';
+import { clientsRoutes, OwnerSessions, sessionCookie } from './clients.js';
+import { consentPage, errorPage, sendPage } from './pages.js';
+import { safeReason, type GscOAuthProvider } from './provider.js';
 import type { OAuthStore } from './store.js';
 
 export interface OAuthRouterOptions {
@@ -22,34 +23,16 @@ export function resourceMetadataUrl(publicUrl: URL, mcpPath: string): string {
   return getOAuthProtectedResourceMetadataUrl(new URL(mcpPath, publicUrl));
 }
 
-/**
- * Headers for every page: never cached, no scripts, never framed (so the
- * consent buttons can't be clickjacked). No form-action: browsers apply it to
- * the redirect after the consent form, which goes to the client's own URI.
- */
-export function sendPage(res: Response, status: number, html: string): void {
-  res
-    .status(status)
-    .set({
-      'Cache-Control': 'no-store',
-      'Content-Security-Policy': "default-src 'none'; style-src 'unsafe-inline'; frame-ancestors 'none'; base-uri 'none'",
-      'X-Frame-Options': 'DENY',
-      'Referrer-Policy': 'no-referrer',
-      'X-Content-Type-Options': 'nosniff',
-    })
-    .type('html')
-    .send(html);
-}
-
 const str = (v: unknown) => (typeof v === 'string' ? v : undefined);
 
 /**
  * The OAuth authorization server (discovery, /register, /authorize, /token,
- * /revoke from the SDK) plus our Google callback and consent page. Mount at
- * the app root.
+ * /revoke from the SDK) plus our Google callback, the consent page and the
+ * Connected clients page. Mount at the app root.
  */
 export function oauthRouter(o: OAuthRouterOptions): express.Router {
   const router = express.Router();
+  const sessions = new OwnerSessions();
   router.use(
     mcpAuthRouter({
       provider: o.provider,
@@ -60,15 +43,21 @@ export function oauthRouter(o: OAuthRouterOptions): express.Router {
   );
 
   router.get('/oauth/google/callback', async (req, res) => {
-    const ret = await o.provider.handleGoogleReturn({ state: str(req.query.state), code: str(req.query.code), error: str(req.query.error) });
+    let ret;
+    try {
+      ret = await o.provider.handleGoogleReturn({ state: str(req.query.state), code: str(req.query.code), error: str(req.query.error) });
+    } catch (err) {
+      o.logger.error('sign-in callback failed', { error: safeReason(err) });
+      return sendPage(res, 500, errorPage('Sign-in failed. Start the connection again from your client.'));
+    }
     switch (ret.kind) {
       case 'consent':
         return sendPage(res, 200, consentPage(ret));
       case 'redirect':
         return void res.set('Cache-Control', 'no-store').redirect(302, ret.url);
       case 'session':
-        // The Connected clients page handles this kind of sign-in.
-        return sendPage(res, 400, errorPage('This sign-in is not used here.'));
+        o.logger.info('owner signed in to the clients page', { email: ret.email });
+        return void res.set({ 'Cache-Control': 'no-store', 'Set-Cookie': sessionCookie(sessions.create(ret.email)) }).redirect(302, '/clients');
       case 'error':
         return sendPage(res, ret.status, errorPage(ret.message));
     }
@@ -81,6 +70,16 @@ export function oauthRouter(o: OAuthRouterOptions): express.Router {
     const ret = o.provider.decideConsent(str(body.consentId) ?? '', str(body.csrf) ?? '', decision === 'approve');
     if (ret.kind === 'error') return sendPage(res, ret.status, errorPage(ret.message));
     res.set('Cache-Control', 'no-store').redirect(302, ret.url);
+  });
+
+  router.use(clientsRoutes({ provider: o.provider, store: o.store, sessions, fixedClients: o.fixedClients, logger: o.logger }));
+
+  // Body-parser failures on these forms (too large, malformed) as pages, not JSON-RPC errors.
+  router.use(['/oauth', '/clients'], (err: { status?: number }, _req: Request, res: Response, next: NextFunction) => {
+    if (res.headersSent) return next(err);
+    const status = err.status && err.status >= 400 && err.status < 500 ? err.status : 500;
+    if (status === 500) o.logger.error('sign-in page failed', { error: safeReason(err) });
+    sendPage(res, status, errorPage(status === 413 ? 'The form was too large.' : 'Something went wrong. Start again from your client.'));
   });
 
   return router;

@@ -66,7 +66,14 @@ function sameSecret(a: string, b: string): boolean {
 }
 
 /** The first part of an error message: google-auth-library appends the ID token or its payload after a colon. */
-const safeReason = (err: unknown) => String((err as Error)?.message ?? err).split(':')[0]!.slice(0, 120);
+export const safeReason = (err: unknown) => String((err as Error)?.message ?? err).split(':')[0]!.slice(0, 120);
+
+/** Where codes go, for the consent page and the clients list: the host for https, otherwise scheme and host (or just the scheme). */
+export function redirectTarget(redirectUri: string): string {
+  const url = new URL(redirectUri);
+  if (url.protocol === 'https:') return url.host;
+  return url.host ? `${url.protocol}//${url.host}` : url.protocol;
+}
 
 /** Adds OAuth response parameters to a client's redirect URI. */
 function redirectWith(redirectUri: string, params: Record<string, string | undefined>): string {
@@ -170,7 +177,7 @@ export class GscOAuthProvider implements OAuthServerProvider {
       consentId,
       csrf: consent.csrf,
       clientName: consent.clientName,
-      redirectHost: new URL(p.params.redirectUri).host,
+      redirectHost: redirectTarget(p.params.redirectUri),
       expiresOn: consent.expiresOn,
     };
   }
@@ -197,7 +204,7 @@ export class GscOAuthProvider implements OAuthServerProvider {
     }
     const code = random();
     this.codes.set(code, { clientId: c.clientId, clientName: c.clientName, email: c.email, expiresOn: c.expiresOn, redirectUri, challenge: codeChallenge, expiresAt: Date.now() + PENDING_TTL_MS });
-    this.o.logger.info('client approved', { client: c.clientName, redirectHost: new URL(redirectUri).host });
+    this.o.logger.info('client approved', { client: c.clientName, redirectHost: redirectTarget(redirectUri) });
     return { kind: 'redirect', url: redirectWith(redirectUri, { code, state }) };
   }
 
@@ -212,7 +219,7 @@ export class GscOAuthProvider implements OAuthServerProvider {
     if (!c || c.clientId !== client.client_id) throw new InvalidGrantError('Invalid or expired authorization code.');
     if (redirectUri !== undefined && redirectUri !== c.redirectUri) throw new InvalidGrantError('redirect_uri does not match the authorization request.');
     if (!this.o.store.getClient(c.clientId)) throw new InvalidGrantError('This client is no longer registered.');
-    const grant = this.o.store.createGrant({ clientId: c.clientId, clientName: c.clientName, email: c.email, redirectHost: new URL(c.redirectUri).host, expiresOn: c.expiresOn });
+    const grant = this.o.store.createGrant({ clientId: c.clientId, clientName: c.clientName, email: c.email, redirectHost: redirectTarget(c.redirectUri), expiresOn: c.expiresOn });
     this.o.logger.info('client connected', { client: `oauth:${grant.clientName}#${grant.id.slice(0, 6)}`, redirectHost: grant.redirectHost, expiresAt: grant.expiresAt });
     return this.o.store.issueTokens(grant.id);
   }

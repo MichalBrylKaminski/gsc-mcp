@@ -4,7 +4,7 @@ import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/share
 import type { Response } from 'express';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Logger } from '../src/logger.js';
-import { GscOAuthProvider } from '../src/oauth/provider.js';
+import { GscOAuthProvider, redirectTarget } from '../src/oauth/provider.js';
 import { OAuthStore } from '../src/oauth/store.js';
 import { fakeGoogle } from './helpers.js';
 
@@ -45,6 +45,14 @@ beforeEach(() => {
   vi.setSystemTime(new Date('2026-11-24T15:00:00Z'));
 });
 afterEach(() => vi.useRealTimers());
+
+describe('redirectTarget', () => {
+  it('shows where codes go', () => {
+    expect(redirectTarget('https://grok.example/cb')).toBe('grok.example');
+    expect(redirectTarget('http://localhost:33418/callback')).toBe('http://localhost:33418');
+    expect(redirectTarget('com.example.app:/cb')).toBe('com.example.app:');
+  });
+});
 
 describe('GscOAuthProvider', () => {
   it('authorize redirects to Google and keeps the request', async () => {
