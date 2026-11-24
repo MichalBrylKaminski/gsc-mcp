@@ -202,8 +202,8 @@ export class OAuthStore {
       redirect_uris: [...uris],
       token_endpoint_auth_method: 'none',
       ...(given.client_name !== undefined ? { client_name: String(given.client_name).slice(0, MAX_METADATA_STRING) } : {}),
-      ...(given.grant_types ? { grant_types: given.grant_types.slice(0, 5).map(String) } : {}),
-      ...(given.response_types ? { response_types: given.response_types.slice(0, 5).map(String) } : {}),
+      ...(given.grant_types ? { grant_types: given.grant_types.slice(0, 5).map((t) => String(t).slice(0, 64)) } : {}),
+      ...(given.response_types ? { response_types: given.response_types.slice(0, 5).map((t) => String(t).slice(0, 64)) } : {}),
       ...(given.scope !== undefined ? { scope: String(given.scope).slice(0, MAX_METADATA_STRING) } : {}),
     };
     this.clients.set(client.client_id, { ...client, registeredAt: Date.now() });
