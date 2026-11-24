@@ -290,11 +290,11 @@ export class OAuthStore {
     return client;
   }
 
-  /** Revokes the grant behind an access or refresh token (RFC 7009); unknown tokens are ignored. */
-  revokeToken(token: string): void {
+  /** Revokes the grant behind an access or refresh token (RFC 7009); unknown tokens, or another client's, are ignored. */
+  revokeToken(token: string, clientId?: string): void {
     const hash = sha256(token);
     const g = this.byAccess.get(hash) ?? this.byRefresh.get(hash) ?? this.byUsedRefresh.get(hash);
-    if (g) this.removeGrant(g);
+    if (g && (clientId === undefined || g.clientId === clientId)) this.removeGrant(g);
   }
 
   revokeGrant(id: string): boolean {

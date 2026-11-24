@@ -1,6 +1,6 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
 import type { OAuthRegisteredClientsStore } from '@modelcontextprotocol/sdk/server/auth/clients.js';
-import { InvalidGrantError, InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
+import { InvalidGrantError, InvalidTokenError, TooManyRequestsError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import type { AuthorizationParams, OAuthServerProvider } from '@modelcontextprotocol/sdk/server/auth/provider.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import type { OAuthClientInformationFull, OAuthTokenRevocationRequest, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
@@ -34,11 +34,13 @@ interface Consent {
   expiresAt: number;
 }
 
+/** An approved request. The grant is created only when the code is exchanged, so an unused approval leaves nothing behind. */
 interface Code {
   clientId: string;
+  clientName: string;
+  email: string;
   redirectUri: string;
   challenge: string;
-  grantId: string;
   expiresAt: number;
 }
 
@@ -59,6 +61,9 @@ function sameSecret(a: string, b: string): boolean {
   const y = Buffer.from(b);
   return x.length === y.length && timingSafeEqual(x, y);
 }
+
+/** The first part of an error message: google-auth-library appends the ID token or its payload after a colon. */
+const safeReason = (err: unknown) => String((err as Error)?.message ?? err).split(':')[0]!.slice(0, 120);
 
 /** Adds OAuth response parameters to a client's redirect URI. */
 function redirectWith(redirectUri: string, params: Record<string, string | undefined>): string {
@@ -94,7 +99,7 @@ export class GscOAuthProvider implements OAuthServerProvider {
   private sweep<T extends { expiresAt: number }>(map: Map<string, T>): void {
     const now = Date.now();
     for (const [k, v] of map) if (now >= v.expiresAt) map.delete(k);
-    if (map.size >= MAX_PENDING) throw new Error('too many sign-ins in progress');
+    if (map.size >= MAX_PENDING) throw new TooManyRequestsError('Too many sign-ins are in progress; try again in a few minutes.');
   }
 
   /** Takes a single-use entry: it is deleted whether or not it is still valid. */
@@ -128,16 +133,17 @@ export class GscOAuthProvider implements OAuthServerProvider {
     if (!p) return { kind: 'error', status: 400, message: STALE };
     const denied = (reason: string, email?: string): GoogleReturn => {
       if (email !== undefined) this.o.logger.warn('sign-in refused', { email, reason });
+      else this.o.logger.warn('sign-in cancelled', { reason });
       if (p.kind === 'session') return { kind: 'error', status: 403, message: 'Sign-in was refused or cancelled.' };
       return { kind: 'redirect', url: redirectWith(p.params.redirectUri, { error: 'access_denied', error_description: 'The server owner did not approve this client.', state: p.params.state }) };
     };
-    if (q.error || !q.code) return denied(q.error ?? 'no code from Google');
+    if (q.error || !q.code) return denied((q.error ?? 'no code from Google').slice(0, 64));
 
     let identity;
     try {
       identity = await this.o.google.verify(q.code);
     } catch (err) {
-      this.o.logger.warn('Google sign-in failed', { error: (err as Error).message });
+      this.o.logger.warn('Google sign-in failed', { error: safeReason(err) });
       return { kind: 'error', status: 400, message: 'Google sign-in failed. Start the connection again from your client.' };
     }
     if (identity.nonce === undefined || !sameSecret(identity.nonce, p.nonce)) {
@@ -181,11 +187,14 @@ export class GscOAuthProvider implements OAuthServerProvider {
       return { kind: 'redirect', url: redirectWith(redirectUri, { error: 'access_denied', error_description: 'The server owner denied this client.', state }) };
     }
     if (!this.o.store.getClient(c.clientId)) return { kind: 'error', status: 400, message: 'This client is no longer registered. Start the connection again from your client.' };
-    const grant = this.o.store.createGrant({ clientId: c.clientId, clientName: c.clientName, email: c.email, redirectHost: new URL(redirectUri).host });
-    this.sweep(this.codes);
+    try {
+      this.sweep(this.codes);
+    } catch {
+      return { kind: 'error', status: 400, message: 'Too many sign-ins are in progress; try again in a few minutes.' };
+    }
     const code = random();
-    this.codes.set(code, { clientId: c.clientId, redirectUri, challenge: codeChallenge, grantId: grant.id, expiresAt: Date.now() + PENDING_TTL_MS });
-    this.o.logger.info('client approved', { client: `oauth:${grant.clientName}#${grant.id.slice(0, 6)}`, redirectHost: grant.redirectHost, expiresAt: grant.expiresAt });
+    this.codes.set(code, { clientId: c.clientId, clientName: c.clientName, email: c.email, redirectUri, challenge: codeChallenge, expiresAt: Date.now() + PENDING_TTL_MS });
+    this.o.logger.info('client approved', { client: c.clientName, redirectHost: new URL(redirectUri).host });
     return { kind: 'redirect', url: redirectWith(redirectUri, { code, state }) };
   }
 
@@ -199,7 +208,10 @@ export class GscOAuthProvider implements OAuthServerProvider {
     const c = this.take(this.codes, authorizationCode);
     if (!c || c.clientId !== client.client_id) throw new InvalidGrantError('Invalid or expired authorization code.');
     if (redirectUri !== undefined && redirectUri !== c.redirectUri) throw new InvalidGrantError('redirect_uri does not match the authorization request.');
-    return this.o.store.issueTokens(c.grantId);
+    if (!this.o.store.getClient(c.clientId)) throw new InvalidGrantError('This client is no longer registered.');
+    const grant = this.o.store.createGrant({ clientId: c.clientId, clientName: c.clientName, email: c.email, redirectHost: new URL(c.redirectUri).host });
+    this.o.logger.info('client connected', { client: `oauth:${grant.clientName}#${grant.id.slice(0, 6)}`, redirectHost: grant.redirectHost, expiresAt: grant.expiresAt });
+    return this.o.store.issueTokens(grant.id);
   }
 
   async exchangeRefreshToken(client: OAuthClientInformationFull, refreshToken: string): Promise<OAuthTokens> {
@@ -212,7 +224,8 @@ export class GscOAuthProvider implements OAuthServerProvider {
     return { token: '', clientId: client.name, scopes: [], expiresAt: Math.floor(Date.parse(client.expiresAt!) / 1000), extra: { client } };
   }
 
-  async revokeToken(_client: OAuthClientInformationFull, request: OAuthTokenRevocationRequest): Promise<void> {
-    this.o.store.revokeToken(request.token);
+  /** RFC 7009: a client can revoke only its own tokens; anything else is ignored. */
+  async revokeToken(client: OAuthClientInformationFull, request: OAuthTokenRevocationRequest): Promise<void> {
+    this.o.store.revokeToken(request.token, client.client_id);
   }
 }

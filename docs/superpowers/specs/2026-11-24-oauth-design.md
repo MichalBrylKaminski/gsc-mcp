@@ -42,7 +42,7 @@ All pieces live in the existing app, which owns the whole `saturn.brylex-it.dev`
 5. **Consent page**: "Allow **<client name>** to read your Search Console data? Codes will be sent to **<redirect host>**. Access ends on **<date>**." Approve / Deny.
    - Needed even after Google sign-in: anyone can register a client with their own `redirect_uri` and send the owner an `/authorize` link; if the owner is already signed in to Google, Google may not prompt, and the code would go to the attacker. The page shows which client asks and where the code goes, and needs a click.
    - The Approve form carries a single-use CSRF token bound to the pending request.
-6. On Approve, the server creates the grant and redirects to the client's `redirect_uri` with a single-use code (5 min, in memory). The client exchanges it at `/token`.
+6. On Approve, the server redirects to the client's `redirect_uri` with a single-use code (5 min, in memory). The client exchanges it at `/token`, and only then is the grant created, so an approval whose code is never exchanged leaves nothing behind.
 
 Deny or a disallowed email: redirect to the client's `redirect_uri` with `error=access_denied`; log a warning with the email.
 

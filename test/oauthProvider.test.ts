@@ -1,33 +1,16 @@
-import { InvalidGrantError, InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
+import { InvalidGrantError, InvalidTokenError, TooManyRequestsError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import type { AuthorizationParams } from '@modelcontextprotocol/sdk/server/auth/provider.js';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { Response } from 'express';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import type { Logger } from '../src/logger.js';
-import type { GoogleIdentity, GoogleSignIn } from '../src/oauth/google.js';
 import { GscOAuthProvider } from '../src/oauth/provider.js';
 import { OAuthStore } from '../src/oauth/store.js';
-
-/** Google stand-in: authUrl records state and nonce; verify returns the queued identity with the nonce Google was given. */
-export function fakeGoogle() {
-  const issued: { state: string; nonce: string }[] = [];
-  let next: Partial<GoogleIdentity> | Error = { email: 'owner@example.com', emailVerified: true };
-  const google: GoogleSignIn = {
-    authUrl(state, nonce) {
-      issued.push({ state, nonce });
-      return `https://google.test/auth?state=${encodeURIComponent(state)}&nonce=${encodeURIComponent(nonce)}`;
-    },
-    async verify() {
-      if (next instanceof Error) throw next;
-      return { email: 'owner@example.com', emailVerified: true, nonce: issued.at(-1)?.nonce, ...next };
-    },
-  };
-  return { google, issued, setNext: (n: Partial<GoogleIdentity> | Error) => (next = n), lastState: () => issued.at(-1)!.state };
-}
+import { fakeGoogle } from './helpers.js';
 
 function spyLogger() {
   const calls: { level: string; msg: string; fields?: Record<string, unknown> }[] = [];
-  const logger: Logger = { debug() {}, info() {}, warn: (msg, fields) => calls.push({ level: 'warn', msg, fields }), error: (msg, fields) => calls.push({ level: 'error', msg, fields }) };
+  const logger: Logger = { debug() {}, info: (msg, fields) => calls.push({ level: 'info', msg, fields }), warn: (msg, fields) => calls.push({ level: 'warn', msg, fields }), error: (msg, fields) => calls.push({ level: 'error', msg, fields }) };
   return { logger, calls };
 }
 
@@ -192,6 +175,77 @@ describe('GscOAuthProvider', () => {
     const late = await code();
     vi.setSystemTime(new Date(Date.now() + 300_001));
     await expect(p.provider.exchangeAuthorizationCode(CLIENT, late)).rejects.toThrow(InvalidGrantError);
+  });
+
+  it('rejects an ID token without a nonce', async () => {
+    const p = setup();
+    p.g.setNext({ nonce: undefined });
+    expect((await toConsent(p)).ret).toMatchObject({ kind: 'error', status: 400 });
+  });
+
+  it('logs a cancel at Google', async () => {
+    const p = setup();
+    const { res } = fakeRes();
+    await p.provider.authorize(CLIENT, PARAMS, res);
+    await p.provider.handleGoogleReturn({ state: p.g.lastState(), error: 'access_denied' });
+    expect(p.calls).toContainEqual(expect.objectContaining({ level: 'warn', msg: 'sign-in cancelled', fields: { reason: 'access_denied' } }));
+  });
+
+  it('caps sign-ins in progress', async () => {
+    const p = setup();
+    const { res } = fakeRes();
+    for (let i = 0; i < 1000; i++) await p.provider.authorize(CLIENT, PARAMS, res);
+    await expect(p.provider.authorize(CLIENT, PARAMS, res)).rejects.toThrow(TooManyRequestsError);
+    vi.setSystemTime(new Date(Date.now() + 300_001));
+    await expect(p.provider.authorize(CLIENT, PARAMS, res)).resolves.toBeUndefined();
+  });
+
+  it('creates the grant only when the code is exchanged', async () => {
+    const p = setup();
+    const { ret } = await toConsent(p);
+    if (ret.kind !== 'consent') throw new Error('expected consent');
+    const code = new URL((p.provider.decideConsent(ret.consentId, ret.csrf, true) as { url: string }).url).searchParams.get('code')!;
+    expect(p.store.grants()).toEqual([]);
+    await p.provider.exchangeAuthorizationCode(CLIENT, code);
+    expect(p.store.grants()).toHaveLength(1);
+  });
+
+  it('refuses to approve for a client that is gone', async () => {
+    const p = setup();
+    const { ret } = await toConsent(p);
+    if (ret.kind !== 'consent') throw new Error('expected consent');
+    const spy = vi.spyOn(p.store, 'getClient').mockReturnValue(undefined);
+    expect(p.provider.decideConsent(ret.consentId, ret.csrf, true)).toMatchObject({ kind: 'error', status: 400 });
+    spy.mockRestore();
+    expect(p.store.grants()).toEqual([]);
+  });
+
+  it('ignores revocation by another client', async () => {
+    const p = setup();
+    const { ret } = await toConsent(p);
+    if (ret.kind !== 'consent') throw new Error('expected consent');
+    const code = new URL((p.provider.decideConsent(ret.consentId, ret.csrf, true) as { url: string }).url).searchParams.get('code')!;
+    const t = await p.provider.exchangeAuthorizationCode(CLIENT, code);
+    await p.provider.revokeToken!({ ...CLIENT, client_id: 'other' }, { token: t.access_token });
+    expect(p.store.grants()).toHaveLength(1);
+  });
+
+  it('never logs secrets', async () => {
+    const p = setup();
+    const secrets: string[] = [];
+    const { ret } = await toConsent(p);
+    if (ret.kind !== 'consent') throw new Error('expected consent');
+    secrets.push(p.g.issued[0]!.state, p.g.issued[0]!.nonce, ret.consentId, ret.csrf);
+    const code = new URL((p.provider.decideConsent(ret.consentId, ret.csrf, true) as { url: string }).url).searchParams.get('code')!;
+    const t = await p.provider.exchangeAuthorizationCode(CLIENT, code);
+    secrets.push(code, t.access_token, t.refresh_token!);
+    p.g.setNext(new Error('Invalid token signature: eyJhbGciOiJSUzI1NiJ9.secret-id-token'));
+    await toConsent(p);
+    secrets.push('eyJhbGciOiJSUzI1NiJ9.secret-id-token');
+    const logged = JSON.stringify(p.calls);
+    expect(p.calls.length).toBeGreaterThan(2);
+    for (const secret of secrets) expect(logged).not.toContain(secret);
+    expect(logged).toContain('Invalid token signature');
   });
 
   it('signs in for the clients page', async () => {
