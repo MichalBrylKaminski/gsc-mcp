@@ -1,3 +1,4 @@
+import { createHash, randomBytes } from 'node:crypto';
 import { mkdtempSync } from 'node:fs';
 import type { AddressInfo } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -9,7 +10,7 @@ import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from 'vitest
 import { createApp } from '../src/http.js';
 import { silentLogger } from '../src/logger.js';
 import { OAuthStore } from '../src/oauth/store.js';
-import { fakeApi, makeService, tokenRegistry } from './helpers.js';
+import { fakeApi, fakeGoogle, makeService, tokenRegistry } from './helpers.js';
 
 const TOKEN = 'test-token-0123456789abcdef0123456789abcdef';
 const OLD_TOKEN = 'old-token-0123456789abcdef0123456789abcdef';
@@ -113,5 +114,180 @@ describe('bearer check with OAuth', () => {
     const res = await listSites(late);
     expect(res.structuredContent).toMatchObject({ tokenNotice: expect.stringMatching(/sign in with Google again/) });
     expect((res.structuredContent as { tokenNotice: string }).tokenNotice).toMatch(/^This client's sign-in \(oauth:Grok#[0-9a-f]{6}\) expires in 10 days/);
+  });
+});
+
+/** An app on a real port with OAuth on, whose issuer is its own address. */
+export async function startOAuthApp(opts: { allowedEmails?: string[] } = {}) {
+  const { createServer } = await import('node:http');
+  const { GscOAuthProvider } = await import('../src/oauth/provider.js');
+  const { oauthRouter, resourceMetadataUrl } = await import('../src/oauth/routes.js');
+  const g = fakeGoogle();
+  const server = createServer();
+  server.listen(0, '127.0.0.1');
+  await new Promise((r) => server.once('listening', r));
+  const base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+  const publicUrl = new URL(base);
+  const store = new OAuthStore({ ttlDays: 90, logger: silentLogger });
+  const provider = new GscOAuthProvider({ store, google: g.google, allowedEmails: opts.allowedEmails ?? ['owner@example.com'], ttlDays: 90, logger: silentLogger });
+  const tokens = tokenRegistry([{ label: 'test', token: TOKEN }]);
+  const app = createApp({
+    tokens,
+    mcpPath: '/gsc-mcp',
+    oauth: {
+      store,
+      resourceMetadataUrl: resourceMetadataUrl(publicUrl, '/gsc-mcp'),
+      router: oauthRouter({ provider, publicUrl, mcpPath: '/gsc-mcp', store, fixedClients: () => tokens.clients(), logger: silentLogger }),
+    },
+    deps: { service: makeService(fakeApi()), logger: silentLogger, maxRowsPerCall: 25_000 },
+    logger: silentLogger,
+  });
+  server.on('request', app);
+  return { base, g, store, provider, close: () => new Promise((r) => server.close(r)) };
+}
+
+const pkce = () => {
+  const verifier = randomBytes(32).toString('base64url');
+  return { verifier, challenge: createHash('sha256').update(verifier).digest('base64url') };
+};
+
+/** Registers a client and walks it to the consent page; returns what the next steps need. */
+export async function toConsentPage(base: string, g: ReturnType<typeof fakeGoogle>, clientName = 'Grok') {
+  const reg = await fetch(`${base}/register`, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json' },
+    body: JSON.stringify({ redirect_uris: ['http://127.0.0.1:9/cb'], client_name: clientName, token_endpoint_auth_method: 'none', grant_types: ['authorization_code', 'refresh_token'], response_types: ['code'] }),
+  });
+  expect(reg.status).toBe(201);
+  const client = (await reg.json()) as { client_id: string; client_secret?: string };
+  expect(client.client_secret).toBeUndefined();
+  const { verifier, challenge } = pkce();
+  const authorize = new URL(`${base}/authorize`);
+  for (const [k, v] of Object.entries({ response_type: 'code', client_id: client.client_id, redirect_uri: 'http://127.0.0.1:9/cb', code_challenge: challenge, code_challenge_method: 'S256', state: 'xyz' })) {
+    authorize.searchParams.set(k, v);
+  }
+  const toGoogle = await fetch(authorize, { redirect: 'manual' });
+  expect(toGoogle.status).toBe(302);
+  expect(toGoogle.headers.get('location')).toMatch(/^https:\/\/google\.test\/auth\?state=/);
+  const callback = `${base}/oauth/google/callback?state=${encodeURIComponent(g.lastState())}&code=google-code`;
+  const consent = await fetch(callback, { redirect: 'manual' });
+  const html = await consent.text();
+  const field = (name: string) => new RegExp(`name="${name}" value="([^"]+)"`).exec(html)?.[1];
+  return { clientId: client.client_id, verifier, consent, html, callback, consentId: field('consentId'), csrf: field('csrf') };
+}
+
+const form = (fields: Record<string, string>) => ({
+  method: 'POST',
+  headers: { 'content-type': 'application/x-www-form-urlencoded' },
+  body: new URLSearchParams(fields).toString(),
+  redirect: 'manual' as const,
+});
+
+describe('OAuth flow', () => {
+  let app: Awaited<ReturnType<typeof startOAuthApp>>;
+  beforeAll(async () => {
+    app = await startOAuthApp();
+  });
+  afterAll(() => app.close());
+
+  it('serves discovery', async () => {
+    const resource = await (await fetch(`${app.base}/.well-known/oauth-protected-resource/gsc-mcp`)).json();
+    expect(resource).toMatchObject({ resource: `${app.base}/gsc-mcp`, authorization_servers: [`${app.base}/`] });
+    const as = await (await fetch(`${app.base}/.well-known/oauth-authorization-server`)).json();
+    expect(as).toMatchObject({
+      issuer: `${app.base}/`,
+      authorization_endpoint: `${app.base}/authorize`,
+      token_endpoint: `${app.base}/token`,
+      registration_endpoint: `${app.base}/register`,
+      revocation_endpoint: `${app.base}/revoke`,
+      code_challenge_methods_supported: ['S256'],
+    });
+    const challenge = await fetch(`${app.base}/gsc-mcp`, { method: 'POST' });
+    expect(challenge.headers.get('www-authenticate')).toBe(`Bearer resource_metadata="${app.base}/.well-known/oauth-protected-resource/gsc-mcp"`);
+  });
+
+  it('full flow: register, Google, consent, token, MCP call, refresh, reuse', async () => {
+    const c = await toConsentPage(app.base, app.g);
+    expect(c.consent.status).toBe(200);
+    expect(c.consent.headers.get('content-security-policy')).toContain("frame-ancestors 'none'");
+    expect(c.consent.headers.get('cache-control')).toBe('no-store');
+    expect(c.html).toContain('Grok');
+    expect(c.html).toContain('127.0.0.1:9');
+    expect(c.html).toMatch(/Access ends on <strong>\d{4}-\d{2}-\d{2}<\/strong>/);
+
+    const approved = await fetch(`${app.base}/oauth/consent`, form({ consentId: c.consentId!, csrf: c.csrf!, decision: 'approve' }));
+    expect(approved.status).toBe(302);
+    const back = new URL(approved.headers.get('location')!);
+    expect(back.origin + back.pathname).toBe('http://127.0.0.1:9/cb');
+    expect(back.searchParams.get('state')).toBe('xyz');
+
+    const token = await fetch(`${app.base}/token`, form({ grant_type: 'authorization_code', code: back.searchParams.get('code')!, code_verifier: c.verifier, client_id: c.clientId, redirect_uri: 'http://127.0.0.1:9/cb' }));
+    expect(token.status).toBe(200);
+    const t1 = (await token.json()) as { access_token: string; refresh_token: string; expires_in: number; token_type: string };
+    expect(t1).toMatchObject({ token_type: 'bearer', expires_in: 3600 });
+
+    const mcp = new Client({ name: 'test', version: '1.0.0' });
+    await mcp.connect(new StreamableHTTPClientTransport(new URL(`${app.base}/gsc-mcp`), { requestInit: { headers: { Authorization: `Bearer ${t1.access_token}` } } }));
+    expect((await mcp.callTool({ name: 'list_sites', arguments: {} })).isError).toBeFalsy();
+    await mcp.close();
+
+    const refreshed = await fetch(`${app.base}/token`, form({ grant_type: 'refresh_token', refresh_token: t1.refresh_token, client_id: c.clientId }));
+    expect(refreshed.status).toBe(200);
+    const t2 = (await refreshed.json()) as { access_token: string; refresh_token: string };
+    expect(t2.refresh_token).not.toBe(t1.refresh_token);
+
+    const reused = await fetch(`${app.base}/token`, form({ grant_type: 'refresh_token', refresh_token: t1.refresh_token, client_id: c.clientId }));
+    expect(reused.status).toBe(400);
+    expect(await reused.json()).toMatchObject({ error: 'invalid_grant' });
+    const after = await fetch(`${app.base}/gsc-mcp`, { method: 'POST', headers: { authorization: `Bearer ${t2.access_token}`, 'content-type': 'application/json' }, body: '{}' });
+    expect(after.status).toBe(401);
+  });
+
+  it('escapes the client name', async () => {
+    const c = await toConsentPage(app.base, app.g, '<script>alert(1)</script>');
+    expect(c.html).toContain('&lt;script&gt;alert(1)&lt;/script&gt;');
+    expect(c.html).not.toContain('<script>alert');
+  });
+
+  it('rejects a replayed callback', async () => {
+    const c = await toConsentPage(app.base, app.g);
+    const again = await fetch(c.callback);
+    expect(again.status).toBe(400);
+    expect(again.headers.get('content-type')).toMatch(/text\/html/);
+    expect(await again.text()).toMatch(/expired or was already used/);
+  });
+
+  it('rejects a consent POST without the right csrf', async () => {
+    const c = await toConsentPage(app.base, app.g);
+    expect((await fetch(`${app.base}/oauth/consent`, form({ consentId: c.consentId!, csrf: 'wrong', decision: 'approve' }))).status).toBe(400);
+    expect((await fetch(`${app.base}/oauth/consent`, form({ consentId: c.consentId!, decision: 'approve' }))).status).toBe(400);
+    expect((await fetch(`${app.base}/oauth/consent`, form({ consentId: c.consentId!, csrf: c.csrf!, decision: 'maybe' }))).status).toBe(400);
+  });
+
+  it('denies when asked', async () => {
+    const c = await toConsentPage(app.base, app.g);
+    const denied = await fetch(`${app.base}/oauth/consent`, form({ consentId: c.consentId!, csrf: c.csrf!, decision: 'deny' }));
+    expect(denied.status).toBe(302);
+    expect(new URL(denied.headers.get('location')!).searchParams.get('error')).toBe('access_denied');
+  });
+
+  it('rejects a wrong PKCE verifier', async () => {
+    const c = await toConsentPage(app.base, app.g);
+    const approved = await fetch(`${app.base}/oauth/consent`, form({ consentId: c.consentId!, csrf: c.csrf!, decision: 'approve' }));
+    const code = new URL(approved.headers.get('location')!).searchParams.get('code')!;
+    const bad = await fetch(`${app.base}/token`, form({ grant_type: 'authorization_code', code, code_verifier: pkce().verifier, client_id: c.clientId, redirect_uri: 'http://127.0.0.1:9/cb' }));
+    expect(bad.status).toBe(400);
+    expect(await bad.json()).toMatchObject({ error: 'invalid_grant' });
+  });
+
+  it('lets a client revoke its token', async () => {
+    const c = await toConsentPage(app.base, app.g);
+    const approved = await fetch(`${app.base}/oauth/consent`, form({ consentId: c.consentId!, csrf: c.csrf!, decision: 'approve' }));
+    const code = new URL(approved.headers.get('location')!).searchParams.get('code')!;
+    const t = (await (await fetch(`${app.base}/token`, form({ grant_type: 'authorization_code', code, code_verifier: c.verifier, client_id: c.clientId }))).json()) as { access_token: string };
+    const revoked = await fetch(`${app.base}/revoke`, form({ token: t.access_token, client_id: c.clientId }));
+    expect(revoked.status).toBe(200);
+    const after = await fetch(`${app.base}/gsc-mcp`, { method: 'POST', headers: { authorization: `Bearer ${t.access_token}`, 'content-type': 'application/json' }, body: '{}' });
+    expect(after.status).toBe(401);
   });
 });

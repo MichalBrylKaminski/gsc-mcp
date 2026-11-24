@@ -1,3 +1,4 @@
+import type { GoogleIdentity, GoogleSignIn } from '../src/oauth/google.js';
 import { TokenRegistry, type TokenRegistryOptions } from '../src/auth.js';
 import type { AuthToken } from '../src/config.js';
 import type { GscApi } from '../src/google/client.js';
@@ -43,4 +44,21 @@ export function googleError(status: number, reason?: string, message = 'error', 
 /** Accepted tokens for createApp; auto-expire is off unless opts turn it on. */
 export function tokenRegistry(tokens: AuthToken[], opts: Partial<TokenRegistryOptions> = {}): TokenRegistry {
   return new TokenRegistry(tokens, { autoExpire: false, logger: silentLogger, ...opts });
+}
+
+/** Google stand-in: authUrl records state and nonce; verify returns the queued identity with the nonce Google was given. */
+export function fakeGoogle() {
+  const issued: { state: string; nonce: string }[] = [];
+  let next: Partial<GoogleIdentity> | Error = { email: 'owner@example.com', emailVerified: true };
+  const google: GoogleSignIn = {
+    authUrl(state, nonce) {
+      issued.push({ state, nonce });
+      return `https://google.test/auth?state=${encodeURIComponent(state)}&nonce=${encodeURIComponent(nonce)}`;
+    },
+    async verify() {
+      if (next instanceof Error) throw next;
+      return { email: 'owner@example.com', emailVerified: true, nonce: issued.at(-1)?.nonce, ...next };
+    },
+  };
+  return { google, issued, setNext: (n: Partial<GoogleIdentity> | Error) => (next = n), lastState: () => issued.at(-1)!.state };
 }
