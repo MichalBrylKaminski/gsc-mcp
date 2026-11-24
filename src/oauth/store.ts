@@ -13,6 +13,8 @@ export const MAX_CLIENTS = 100;
 /** How often a changed "last used" time is saved. */
 export const LAST_USED_FLUSH_MS = 60_000;
 export const CLIENT_NAME_MAX = 64;
+const MAX_REDIRECT_URIS = 10;
+const MAX_METADATA_STRING = 2048;
 
 /** What the Connected clients page and logs may know about a grant. */
 export interface GrantView {
@@ -69,6 +71,29 @@ const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
 const newToken = () => randomBytes(32).toString('base64url');
 const iso = (ms: number) => new Date(ms).toISOString();
 
+const isStr = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
+const isTime = (v: unknown): v is number => typeof v === 'number' && Number.isFinite(v);
+
+function validClient(c: unknown): c is StoredClient {
+  const x = c as StoredClient | null;
+  return !!x && isStr(x.client_id) && isTime(x.registeredAt) && Array.isArray(x.redirect_uris) && x.redirect_uris.every(isStr) && !('client_secret' in x);
+}
+
+function validGrant(g: unknown): g is StoredGrant {
+  const x = g as StoredGrant | null;
+  return (
+    !!x &&
+    [x.id, x.clientId, x.clientName, x.email, x.redirectHost].every(isStr) &&
+    isTime(x.createdAt) &&
+    isTime(x.expiresAt) &&
+    (x.lastUsedAt === undefined || isTime(x.lastUsedAt)) &&
+    (x.accessHash === undefined || (isStr(x.accessHash) && isTime(x.accessExpiresAt))) &&
+    (x.refreshHash === undefined || isStr(x.refreshHash)) &&
+    Array.isArray(x.usedRefreshHashes) &&
+    x.usedRefreshHashes.every(isStr)
+  );
+}
+
 /** A client-chosen name, safe to show and log: no control or format characters, at most 64 characters. */
 export function cleanClientName(name: string | undefined): string {
   const cleaned = (name ?? '').replace(/[\p{C}]/gu, '').trim().slice(0, CLIENT_NAME_MAX).trim();
@@ -115,8 +140,16 @@ export class OAuthStore {
     try {
       const state = JSON.parse(text) as State;
       if (state?.version !== 1 || !Array.isArray(state.clients) || !Array.isArray(state.grants)) throw new Error('unexpected format');
-      for (const c of state.clients) this.clients.set(c.client_id, c);
-      for (const g of state.grants) this.index({ ...g, usedRefreshHashes: g.usedRefreshHashes ?? [] });
+      let dropped = 0;
+      for (const c of state.clients as unknown[]) {
+        if (validClient(c)) this.clients.set(c.client_id, c);
+        else dropped++;
+      }
+      for (const g of state.grants as unknown[]) {
+        if (validGrant(g) && this.clients.has(g.clientId)) this.index(g);
+        else dropped++;
+      }
+      if (dropped) this.opts.logger.warn('dropped malformed OAuth state entries', { file: path, dropped });
     } catch (err) {
       const aside = `${path}.corrupt-${Date.now()}`;
       try {
@@ -149,12 +182,30 @@ export class OAuthStore {
     return client;
   }
 
-  /** Called by the SDK's /register handler, which has already assigned client_id. */
+  /**
+   * Called by the SDK's /register handler, which has already assigned client_id
+   * (and a client_secret, unless the client asked to be public). Every client
+   * is made public: the secret is dropped so it is never stored, and PKCE
+   * protects the code exchange instead. Only the fields this server uses are kept.
+   */
   registerClient(info: Omit<OAuthClientInformationFull, 'client_id' | 'client_id_issued_at'>): OAuthClientInformationFull {
     if (this.clients.size >= MAX_CLIENTS) this.prune();
     if (this.clients.size >= MAX_CLIENTS) throw new InvalidClientMetadataError('This server has too many registered clients; try again tomorrow.');
-    const client = { ...info } as OAuthClientInformationFull;
-    if (!client.client_id) client.client_id = randomUUID();
+    const given = info as Partial<OAuthClientInformationFull>;
+    const uris = given.redirect_uris ?? [];
+    if (!uris.length || uris.length > MAX_REDIRECT_URIS || uris.some((u) => typeof u !== 'string' || u.length > MAX_METADATA_STRING)) {
+      throw new InvalidClientMetadataError(`redirect_uris must list 1 to ${MAX_REDIRECT_URIS} URLs of at most ${MAX_METADATA_STRING} characters`);
+    }
+    const client: OAuthClientInformationFull = {
+      client_id: given.client_id || randomUUID(),
+      ...(given.client_id_issued_at !== undefined ? { client_id_issued_at: given.client_id_issued_at } : {}),
+      redirect_uris: [...uris],
+      token_endpoint_auth_method: 'none',
+      ...(given.client_name !== undefined ? { client_name: String(given.client_name).slice(0, MAX_METADATA_STRING) } : {}),
+      ...(given.grant_types ? { grant_types: given.grant_types.slice(0, 5).map(String) } : {}),
+      ...(given.response_types ? { response_types: given.response_types.slice(0, 5).map(String) } : {}),
+      ...(given.scope !== undefined ? { scope: String(given.scope).slice(0, MAX_METADATA_STRING) } : {}),
+    };
     this.clients.set(client.client_id, { ...client, registeredAt: Date.now() });
     this.save();
     return client;

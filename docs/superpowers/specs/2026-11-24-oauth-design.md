@@ -66,7 +66,8 @@ Deny or a disallowed email: redirect to the client's `redirect_uri` with `error=
 `DATA_DIR/oauth-state.json`, written with the existing atomic `JsonFile`:
 
 - registered clients, grants, and token hashes only (never a token itself), plus the hashes of used refresh tokens until their grant expires;
-- written on every change to clients, grants or tokens; `lastUsedAt` is updated in memory and flushed at most once a minute and at shutdown;
+- written on every change to clients, grants or tokens, without waiting for the write: if the process crashes in the instant between issuing a new pair and saving, the previous refresh token works once more after the restart (accepted);
+- entries that fail validation on load are dropped with a warning; client secrets are never stored, because every registered client is made public (`token_endpoint_auth_method: none`, PKCE required), and only the client fields the server uses are kept; `lastUsedAt` is updated in memory and flushed at most once a minute and at shutdown;
 - registration clean-up: a client with no grant is deleted 24 hours after registering; at most 100 registered clients (further registrations are refused with an error);
 - expired grants are deleted on startup and once a day;
 - a file that can't be read or parsed on startup is renamed to `oauth-state.json.corrupt-<timestamp>`, an error is logged, and the server starts with no grants (every client signs in again).

@@ -36,15 +36,15 @@ export const utcDay = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 /** When a token dated `expiresOn` (YYYY-MM-DD) stops working: 00:00 UTC that day. */
 export const expiryMs = (expiresOn: string) => Date.parse(`${expiresOn}T00:00:00Z`);
 
-/**
- * A new random token whose expiry date is `ttlDays` from today (UTC), and the
- * entry to put in MCP_AUTH_TOKENS: "name:token:YYYY-MM-DD".
- */
 /** The expiry date (YYYY-MM-DD) of something issued now with a lifetime of `ttlDays`: today (UTC) + ttlDays. */
 export function expiryDayFor(ttlDays: number, now = Date.now()): string {
   return utcDay(Date.parse(`${utcDay(now)}T00:00:00Z`) + ttlDays * DAY_MS);
 }
 
+/**
+ * A new random token whose expiry date is `ttlDays` from today (UTC), and the
+ * entry to put in MCP_AUTH_TOKENS: "name:token:YYYY-MM-DD".
+ */
 export function issueToken(name: string, ttlDays: number, now = Date.now()) {
   const token = randomBytes(32).toString('hex');
   const expiresOn = expiryDayFor(ttlDays, now);

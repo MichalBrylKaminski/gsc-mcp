@@ -167,6 +167,42 @@ describe('OAuthStore clients', () => {
     expect(() => store.registerClient({ client_id: 'c100', redirect_uris: ['https://x/cb'] } as never)).toThrow(InvalidClientMetadataError);
   });
 
+  it('frees a slot by pruning once the limit is reached', () => {
+    const store = new OAuthStore({ file, ttlDays: 90, logger: silentLogger });
+    for (let i = 0; i < 100; i++) store.registerClient({ client_id: `c${i}`, redirect_uris: ['https://x/cb'] } as never);
+    vi.setSystemTime(new Date(Date.parse(NOW) + 86_400_001));
+    expect(store.registerClient({ client_id: 'late', redirect_uris: ['https://x/cb'] } as never).client_id).toBe('late');
+    expect(store.getClient('c0')).toBeUndefined();
+  });
+
+  it('makes every client public and never stores a secret', async () => {
+    const store = new OAuthStore({ file, ttlDays: 90, logger: silentLogger });
+    const c = store.registerClient({
+      client_id: 'conf',
+      client_secret: 'super-secret-value',
+      client_secret_expires_at: 0,
+      redirect_uris: ['https://x/cb'],
+      client_name: 'Grok',
+      jwks: { keys: ['x'.repeat(10_000)] },
+      logo_uri: 'https://x/logo.png',
+    } as never);
+    expect(c).not.toHaveProperty('client_secret');
+    expect(c).not.toHaveProperty('jwks');
+    expect(c).toMatchObject({ client_id: 'conf', token_endpoint_auth_method: 'none', client_name: 'Grok', redirect_uris: ['https://x/cb'] });
+    expect(store.getClient('conf')).toEqual(c);
+    await store.flush();
+    const text = readFileSync(file, 'utf8');
+    expect(text).not.toContain('super-secret-value');
+    expect(text).not.toContain('logo.png');
+  });
+
+  it('rejects unusable redirect URIs at registration', () => {
+    const store = new OAuthStore({ file, ttlDays: 90, logger: silentLogger });
+    expect(() => store.registerClient({ client_id: 'a', redirect_uris: [] } as never)).toThrow(InvalidClientMetadataError);
+    expect(() => store.registerClient({ client_id: 'b', redirect_uris: Array(11).fill('https://x/cb') } as never)).toThrow(InvalidClientMetadataError);
+    expect(() => store.registerClient({ client_id: 'c', redirect_uris: [`https://x/${'a'.repeat(3000)}`] } as never)).toThrow(InvalidClientMetadataError);
+  });
+
   it('assigns a client id when none is given', () => {
     const store = new OAuthStore({ file, ttlDays: 90, logger: silentLogger });
     const c = store.registerClient({ redirect_uris: ['https://x/cb'] } as never);
@@ -224,6 +260,22 @@ describe('OAuthStore persistence', () => {
     expect(store.grants()).toEqual([]);
     expect(readdirSync(dir).filter((f) => f.startsWith('oauth-state.json.corrupt-'))).toHaveLength(1);
     expect(calls).toContainEqual(expect.objectContaining({ level: 'error' }));
+  });
+
+  it('drops malformed entries and keeps good ones', async () => {
+    const { store, grant } = setup();
+    const t = store.issueTokens(grant.id);
+    await store.flush();
+    const state = JSON.parse(readFileSync(file, 'utf8'));
+    state.clients.push(null, { client_id: 'no-time', redirect_uris: [] });
+    state.grants.push(null, { ...state.grants[0], id: 'no-expiry', expiresAt: undefined }, { ...state.grants[0], id: 'bad-time', createdAt: 'yesterday' });
+    writeFileSync(file, JSON.stringify(state));
+    const { logger, calls } = spyLogger();
+    const again = new OAuthStore({ file, ttlDays: 90, logger });
+    expect(again.grants().map((g) => g.id)).toEqual([grant.id]);
+    expect(again.verifyAccess(t.access_token)).toBeDefined();
+    expect(again.getClient('no-time')).toBeUndefined();
+    expect(calls).toContainEqual(expect.objectContaining({ level: 'warn', msg: 'dropped malformed OAuth state entries', fields: expect.objectContaining({ dropped: 5 }) }));
   });
 
   it('works without a file', () => {
