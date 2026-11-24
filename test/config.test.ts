@@ -101,3 +101,50 @@ describe('token expiry settings', () => {
     expect(() => loadConfig({ GOOGLE_APPLICATION_CREDENTIALS, MCP_AUTH_TOKENS: `grok:${a}:2027-02-30` })).toThrow(/not a real date/);
   });
 });
+
+describe('OAuth settings', () => {
+  const oauthEnv = {
+    MCP_PUBLIC_URL: 'https://saturn.brylex-it.dev/',
+    GOOGLE_OAUTH_CLIENT_ID: 'id',
+    GOOGLE_OAUTH_CLIENT_SECRET: 'secret',
+    MCP_OAUTH_ALLOWED_EMAILS: ' Owner@Example.com ,b@x.dev',
+  };
+
+  it('is off when none of the four are set', () => {
+    expect(loadConfig(base).oauth).toBeUndefined();
+  });
+
+  it('turns on with all four', () => {
+    const { oauth } = loadConfig({ ...base, ...oauthEnv });
+    expect(oauth?.publicUrl.href).toBe('https://saturn.brylex-it.dev/');
+    expect(oauth?.googleClientId).toBe('id');
+    expect(oauth?.googleClientSecret).toBe('secret');
+    expect(oauth?.allowedEmails).toEqual(['owner@example.com', 'b@x.dev']);
+  });
+
+  it('rejects a partial set', () => {
+    expect(() => loadConfig({ ...base, MCP_PUBLIC_URL: oauthEnv.MCP_PUBLIC_URL })).toThrow(/GOOGLE_OAUTH_CLIENT_ID/);
+    expect(() => loadConfig({ ...base, ...oauthEnv, MCP_OAUTH_ALLOWED_EMAILS: ' , ' })).toThrow(/MCP_OAUTH_ALLOWED_EMAILS/);
+  });
+
+  it('rejects a public URL with a path, query or http on a public host', () => {
+    for (const bad of ['https://x.dev/gsc', 'https://x.dev/?a=1', 'https://x.dev/#a', 'http://x.dev', 'not a url']) {
+      expect(() => loadConfig({ ...base, ...oauthEnv, MCP_PUBLIC_URL: bad }), bad).toThrow(/MCP_PUBLIC_URL/);
+    }
+    expect(loadConfig({ ...base, ...oauthEnv, MCP_PUBLIC_URL: 'http://localhost:3000' }).oauth?.publicUrl.href).toBe('http://localhost:3000/');
+    expect(loadConfig({ ...base, ...oauthEnv, MCP_PUBLIC_URL: 'http://127.0.0.1:3000' }).oauth?.publicUrl.href).toBe('http://127.0.0.1:3000/');
+  });
+
+  it('makes fixed tokens optional with OAuth on', () => {
+    const { MCP_AUTH_TOKEN: _t, ...noToken } = base;
+    expect(loadConfig({ ...noToken, ...oauthEnv }).authTokens).toEqual([]);
+    expect(() => loadConfig(noToken)).toThrow(/set MCP_AUTH_TOKEN or MCP_AUTH_TOKENS/);
+  });
+
+  it('parses TRUST_PROXY', () => {
+    expect(loadConfig(base).TRUST_PROXY).toBeUndefined();
+    expect(loadConfig({ ...base, TRUST_PROXY: '2' }).TRUST_PROXY).toBe(2);
+    expect(() => loadConfig({ ...base, TRUST_PROXY: 'x' })).toThrow(/TRUST_PROXY/);
+    expect(() => loadConfig({ ...base, TRUST_PROXY: '11' })).toThrow(/TRUST_PROXY/);
+  });
+});

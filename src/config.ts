@@ -55,6 +55,8 @@ export const tokenFingerprint = (token: string) => `sha256:${createHash('sha256'
 export function parseAuthTokens(
   single: string | undefined,
   list: string[] | undefined,
+  /** False when OAuth sign-in is on, so no fixed token is needed. */
+  required = true,
 ): { tokens: AuthToken[]; errors: { variable: string; message: string }[] } {
   const errors: { variable: string; message: string }[] = [];
   const tokens: AuthToken[] = [];
@@ -88,7 +90,7 @@ export function parseAuthTokens(
     if (name !== undefined && TOKEN_NAME.test(name)) add(name, entry.slice(sep + 1).trim(), 'MCP_AUTH_TOKENS');
     else add(undefined, entry, 'MCP_AUTH_TOKENS');
   }
-  if (!tokens.length && !errors.length) errors.push({ variable: 'MCP_AUTH_TOKEN', message: 'set MCP_AUTH_TOKEN or MCP_AUTH_TOKENS (generate a token with `openssl rand -hex 32`)' });
+  if (required && !tokens.length && !errors.length) errors.push({ variable: 'MCP_AUTH_TOKEN', message: 'set MCP_AUTH_TOKEN or MCP_AUTH_TOKENS (generate a token with `openssl rand -hex 32`)' });
   return { tokens, errors };
 }
 
@@ -99,6 +101,35 @@ export const ttlDaysSchema = z.coerce
   .min(30, 'MCP_AUTH_TOKEN_TTL_DAYS must be at least 30')
   .max(365, 'MCP_AUTH_TOKEN_TTL_DAYS must be at most 365')
   .default(90);
+
+/** OAuth sign-in settings; present only when all four variables are set. */
+export interface OAuthConfig {
+  /** The server's public origin and OAuth issuer; `href` ends in "/". */
+  publicUrl: URL;
+  googleClientId: string;
+  googleClientSecret: string;
+  /** Lowercased. */
+  allowedEmails: string[];
+}
+
+const OAUTH_VARIABLES = ['MCP_PUBLIC_URL', 'GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_SECRET', 'MCP_OAUTH_ALLOWED_EMAILS'] as const;
+
+/** An origin the SDK accepts as an OAuth issuer: https, or http on localhost; no path, query or fragment. */
+function parsePublicUrl(raw: string): URL | string {
+  let url: URL;
+  try {
+    url = new URL(raw.trim());
+  } catch {
+    return 'must be a URL such as https://gsc-mcp.example.com';
+  }
+  const local = url.hostname === 'localhost' || url.hostname === '127.0.0.1';
+  if (url.protocol !== 'https:' && !(local && url.protocol === 'http:')) return 'must use https (http is allowed only for localhost)';
+  if (url.pathname !== '/' || url.search || url.hash || raw.trim().endsWith('?') || raw.trim().endsWith('#')) {
+    return 'must be the bare origin, such as https://gsc-mcp.example.com (no path, query or fragment)';
+  }
+  if (url.username || url.password) return 'must not contain a user name or password';
+  return url;
+}
 
 const bool = z
   .enum(['true', 'false', '1', '0'])
@@ -112,6 +143,13 @@ const ConfigSchema = z.object({
   // Off by default. On: every token must carry a date and stops working at 00:00 UTC that day.
   MCP_AUTH_AUTO_EXPIRE: bool.transform((v) => v ?? false),
   MCP_AUTH_TOKEN_TTL_DAYS: ttlDaysSchema,
+  // OAuth sign-in: on only when all four are set.
+  MCP_PUBLIC_URL: z.string().optional(),
+  GOOGLE_OAUTH_CLIENT_ID: z.string().optional(),
+  GOOGLE_OAUTH_CLIENT_SECRET: z.string().optional(),
+  MCP_OAUTH_ALLOWED_EMAILS: csv,
+  // Number of reverse proxies in front of the app (Express "trust proxy"), so rate limits see real client IPs.
+  TRUST_PROXY: z.coerce.number().int().min(0).max(10).optional(),
   GOOGLE_APPLICATION_CREDENTIALS: z.string().min(1),
   HOST: z.string().default('0.0.0.0'),
   PORT: z.coerce.number().int().min(1).max(65535).default(3000),
@@ -138,7 +176,9 @@ const ConfigSchema = z.object({
   DATA_DIR: z.string().default('./data'),
   LOG_LEVEL: z.enum(['debug', 'info', 'warn', 'error']).default('info'),
 }).transform((c, ctx) => {
-  const { tokens, errors } = parseAuthTokens(c.MCP_AUTH_TOKEN, c.MCP_AUTH_TOKENS);
+  const oauth = parseOAuth(c, (variable, message) => ctx.addIssue({ code: 'custom', path: [variable], message }));
+  const oauthWanted = OAUTH_VARIABLES.some((v) => present(c[v]));
+  const { tokens, errors } = parseAuthTokens(c.MCP_AUTH_TOKEN, c.MCP_AUTH_TOKENS, !oauthWanted);
   for (const e of errors) ctx.addIssue({ code: 'custom', path: [e.variable], message: e.message });
   const undated = tokens.filter((t) => !t.expiresOn).map((t) => t.label);
   if (c.MCP_AUTH_AUTO_EXPIRE && undated.length) {
@@ -148,8 +188,35 @@ const ConfigSchema = z.object({
       message: `with auto-expire on, every token needs an expiry date (name:token:YYYY-MM-DD); missing for ${undated.join(', ')}. Create dated tokens with \`node dist/issueToken.js <name>\``,
     });
   }
-  return { ...c, authTokens: tokens };
+  return { ...c, authTokens: tokens, oauth };
 });
+
+const present = (v: string | string[] | undefined) => (Array.isArray(v) ? v.length > 0 : v !== undefined && v.trim() !== '');
+
+function parseOAuth(
+  c: { MCP_PUBLIC_URL?: string; GOOGLE_OAUTH_CLIENT_ID?: string; GOOGLE_OAUTH_CLIENT_SECRET?: string; MCP_OAUTH_ALLOWED_EMAILS?: string[] },
+  issue: (variable: string, message: string) => void,
+): OAuthConfig | undefined {
+  const set = OAUTH_VARIABLES.filter((v) => present(c[v]));
+  if (!set.length) return undefined;
+  if (set.length < OAUTH_VARIABLES.length) {
+    for (const v of OAUTH_VARIABLES.filter((v) => !set.includes(v))) {
+      issue(v, `OAuth sign-in needs all of ${OAUTH_VARIABLES.join(', ')}; this one is missing`);
+    }
+    return undefined;
+  }
+  const publicUrl = parsePublicUrl(c.MCP_PUBLIC_URL!);
+  if (typeof publicUrl === 'string') {
+    issue('MCP_PUBLIC_URL', publicUrl);
+    return undefined;
+  }
+  return {
+    publicUrl,
+    googleClientId: c.GOOGLE_OAUTH_CLIENT_ID!.trim(),
+    googleClientSecret: c.GOOGLE_OAUTH_CLIENT_SECRET!.trim(),
+    allowedEmails: c.MCP_OAUTH_ALLOWED_EMAILS!.map((e) => e.toLowerCase()),
+  };
+}
 
 export type Config = z.infer<typeof ConfigSchema>;
 
