@@ -44,6 +44,7 @@ Other cross-cutting rules:
 - **Allowlist.** `GSC_ALLOWED_SITES` is enforced in `GscService.site()`, and `list_sites` filters by it.
 - **Errors.** Errors reach the client as `GscToolError` (`code` plus actionable message plus details such as `retryAfterSeconds`/`resetAt`). Tool handlers are wrapped with `handle()` (`tools/common.ts`), which also passes the client's abort `signal` through.
 - **HTTP layer.** `http.ts` creates a new `McpServer` and transport for each POST. GET and DELETE return 405. The endpoint path comes from `MCP_PATH` (default `/mcp`), and `/healthz` needs no auth. `ALLOWED_HOSTS` entries are normalized the same way the SDK parses the Host header.
+- **Auth tokens.** `MCP_AUTH_TOKEN` and `MCP_AUTH_TOKENS` (`name:token` or bare, optional `:YYYY-MM-DD`) are merged by `parseAuthTokens` (`config.ts`). With `MCP_AUTH_AUTO_EXPIRE`, every token must have a date and `TokenRegistry` (`auth.ts`) rejects it from 00:00 UTC that day; the date is the only expiry. `MCP_AUTH_TOKEN_TTL_DAYS` only sets the date `issueToken` (`src/issueToken.ts` CLI, `npm run token -- <name>`) gives new tokens. `bearerAuth` logs each request with the client's name, never the token, and puts the client in `req.auth`; `handle()` adds a `tokenNotice` to results in a token's last 14 days.
 - **Batch time limit.** `batch_inspect_urls` stops after `BATCH_DEADLINE_MS` (90 s), because Cloudflare drops proxied requests after 100 s.
 
 ## Tests

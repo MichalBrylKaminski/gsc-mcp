@@ -1,4 +1,5 @@
 import { join } from 'node:path';
+import { TokenRegistry } from './auth.js';
 import { loadConfig } from './config.js';
 import { createGscApi, readServiceAccountKey } from './google/client.js';
 import { GscService } from './google/service.js';
@@ -26,8 +27,10 @@ async function main() {
     logger,
   });
 
+  const tokens = new TokenRegistry(config.authTokens, { autoExpire: config.MCP_AUTH_AUTO_EXPIRE, logger });
+
   const app = createApp({
-    authToken: config.MCP_AUTH_TOKEN,
+    tokens,
     allowedHosts: config.ALLOWED_HOSTS,
     mcpPath: config.MCP_PATH,
     deps: { service, logger, maxRowsPerCall: config.GSC_MAX_ROWS_PER_CALL },
@@ -45,6 +48,8 @@ async function main() {
       port: config.PORT,
       serviceAccount: serviceAccountEmail,
       allowedSites: config.GSC_ALLOWED_SITES?.length ?? 'all',
+      clients: tokens.clients(),
+      tokenAutoExpire: config.MCP_AUTH_AUTO_EXPIRE,
       safetyFactor: config.QUOTA_SAFETY_FACTOR,
     });
   });

@@ -427,7 +427,10 @@ All settings are environment variables. With Docker Compose they go in `.env`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `MCP_AUTH_TOKEN` | **required** | Bearer token clients must send. At least 32 characters; generate with `openssl rand -hex 32` |
+| `MCP_AUTH_TOKEN` | **required**, unless `MCP_AUTH_TOKENS` is set | Bearer token clients must send. At least 32 characters; generate with `openssl rand -hex 32` |
+| `MCP_AUTH_TOKENS` | (none) | More accepted tokens, comma-separated, each as `name:token` (e.g. `grok:3f1c…,claude-code:9ab2…`) or a bare token, optionally followed by an expiry date, `:YYYY-MM-DD`. Names (letters, digits, `_`, `.`, `-`, up to 32) show in the logs. Used together with `MCP_AUTH_TOKEN`. See [Rotating credentials](#rotating-credentials) |
+| `MCP_AUTH_AUTO_EXPIRE` | `false` | `true` makes each token stop working on the date written on it, and requires every token to have one. See [Token expiry](#token-expiry) |
+| `MCP_AUTH_TOKEN_TTL_DAYS` | `90` | How far from today the token generator sets a new token's date (30–365 days) |
 | `GOOGLE_APPLICATION_CREDENTIALS` | **required** | Path to the service account JSON key. Docker Compose sets it to the mounted secret |
 | `DATA_DIR` | `./data` (`/data` in Docker) | Writable directory for quota counters and pauses |
 | `HOST` | `0.0.0.0` | Interface to listen on |
@@ -472,12 +475,49 @@ Google's published limits ([source](https://developers.google.com/webmaster-tool
 ## Security
 
 - **Read-only access to Google.** The server requests only the `webmasters.readonly` scope. Even a compromised server can't change your Search Console settings.
-- **Bearer token.** Every MCP request needs the token, compared in constant time. Treat it like a password; to rotate it, change `MCP_AUTH_TOKEN`, restart, and update your clients.
+- **Bearer tokens.** Every MCP request needs a valid token, compared in constant time. Treat tokens like passwords. Give each client its own token in `MCP_AUTH_TOKENS`, so you can revoke one without touching the others.
 - **Host check.** Set `ALLOWED_HOSTS` to your domain to reject requests addressed to other hostnames (DNS-rebinding protection).
 - **Property allowlist.** Set `GSC_ALLOWED_SITES` to limit what clients can read, even if the service account has access to more properties.
-- **Key handling.** Keep the key out of the repository (`secrets/` is ignored), readable only by the server's user. If it leaks, delete it in the Cloud console (Service account → Keys) and create a new one.
+- **Token expiry (optional).** With `MCP_AUTH_AUTO_EXPIRE=true`, every token carries an expiry date and stops working on it, so rotation is enforced rather than suggested. See [Token expiry](#token-expiry).
+- **Key handling.** Keep the key out of the repository (`secrets/` is ignored), readable only by the server's user. If it leaks, replace it as described below.
 - **Container hardening.** The Compose file binds to `127.0.0.1`, runs as a non-root user with a read-only filesystem, drops all capabilities and sets `no-new-privileges`.
-- **No secrets in logs.** Logs are structured JSON and never include the token or key.
+- **No secrets in logs.** Logs are structured JSON and never include a token or the key. Each MCP request is logged with the name of the token it used (`"client":"grok"`), or a short hash such as `sha256:1a2b3c4d` for unnamed tokens, and rejected requests are logged as `unauthorized request`. That shows which clients still use an old token.
+
+### Rotating credentials
+
+**A bearer token**, with no downtime (the commands are for Dokku; with Docker Compose, edit `.env` and run `docker compose up -d`):
+
+1. Generate a new token (`node dist/issueToken.js grok-new`, or `openssl rand -hex 32` without auto-expire) and add it next to the old one, e.g. `MCP_AUTH_TOKENS=grok:<old>,grok-new:<new>` (`dokku config:set gsc-mcp MCP_AUTH_TOKENS=...`, which restarts the app).
+2. Switch the client to the new token.
+3. Check the logs (`dokku logs gsc-mcp`) until requests arrive only as `grok-new`.
+4. Remove the old token: `MCP_AUTH_TOKENS=grok:<new>`.
+
+If a token has leaked, skip the waiting: remove it at once, then update the client.
+
+### Token expiry
+
+Off by default. Set `MCP_AUTH_AUTO_EXPIRE=true` to make tokens expire, so a forgotten rotation can't leave a token valid forever:
+
+- **The date on the token is the expiry.** Each entry in `MCP_AUTH_TOKENS` ends with a date, `name:token:YYYY-MM-DD`, and the token stops working at 00:00 UTC that day. Nothing else ends it, and the server keeps no other record. With auto-expire on, the server refuses to start if any token has no date. With it off, dates are ignored.
+- **New tokens get today + TTL.** Create tokens with the generator, which sets the date `MCP_AUTH_TOKEN_TTL_DAYS` (default 90, allowed 30–365) from today:
+
+  ```bash
+  node dist/issueToken.js grok              # in the container: dokku run gsc-mcp node dist/issueToken.js grok
+  # grok:3f1c…9ab2:2027-02-15               (or from a checkout: npm run token -- grok)
+  ```
+
+  Add the printed line to `MCP_AUTH_TOKENS` and give the client only the token part.
+- **What clients see.** An expired token gets `401` with "the token has expired", and the log says `expired token` with the client's name. In the last 14 days, every tool result carries a `tokenNotice` the agent can pass on, `get_quota_status` shows the client's `expiresAt` and `daysLeft`, and the log warns once a day per token.
+- **Rotating in time.** Use the routine above with a freshly generated token: add it, switch the client, remove the old one.
+
+**The service account key:**
+
+1. In the Cloud console, open the service account → Keys → Add key → Create new key → JSON. A service account can have up to 10 keys, so the old one keeps working meanwhile.
+2. Replace the key file on the server (keep its owner and permissions) and restart the server.
+3. Check that a tool call works, e.g. `list_sites`.
+4. Delete the old key in the Cloud console. If you're in a Google Cloud organization, the `iam.serviceAccountKeyExpiryHours` policy can make keys expire on their own.
+
+**An extra layer (optional).** Behind Cloudflare, a [Cloudflare Access service token](https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/) or a WAF rule limited to your clients' IP addresses means a leaked bearer token alone isn't enough.
 
 ## Updating
 

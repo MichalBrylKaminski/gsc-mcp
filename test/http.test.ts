@@ -5,15 +5,16 @@ import { StreamableHTTPClientTransport } from '@modelcontextprotocol/sdk/client/
 import { afterAll, beforeAll, describe, expect, it } from 'vitest';
 import { loadConfig } from '../src/config.js';
 import { createApp } from '../src/http.js';
-import { silentLogger } from '../src/logger.js';
-import { fakeApi, makeService } from './helpers.js';
+import { silentLogger, type Logger } from '../src/logger.js';
+import { fakeApi, makeService, tokenRegistry } from './helpers.js';
 
 const TOKEN = 'test-token-0123456789abcdef0123456789abcdef';
+const TOKENS = [{ label: 'test', token: TOKEN }];
 let server: Server;
 let base: string;
 
 beforeAll(async () => {
-  const app = createApp({ authToken: TOKEN, deps: { service: makeService(fakeApi()), logger: silentLogger, maxRowsPerCall: 25_000 }, logger: silentLogger });
+  const app = createApp({ tokens: tokenRegistry(TOKENS), deps: { service: makeService(fakeApi()), logger: silentLogger, maxRowsPerCall: 25_000 }, logger: silentLogger });
   server = app.listen(0, '127.0.0.1');
   await new Promise((r) => server.once('listening', r));
   base = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
@@ -89,7 +90,7 @@ describe('HTTP edge cases', () => {
   });
 
   it('serves the MCP endpoint at a custom path', async () => {
-    const app = createApp({ authToken: TOKEN, mcpPath: '/gsc-mcp', deps: { service: makeService(fakeApi()), logger: silentLogger, maxRowsPerCall: 25_000 }, logger: silentLogger });
+    const app = createApp({ tokens: tokenRegistry(TOKENS), mcpPath: '/gsc-mcp', deps: { service: makeService(fakeApi()), logger: silentLogger, maxRowsPerCall: 25_000 }, logger: silentLogger });
     const s = app.listen(0, '127.0.0.1');
     await new Promise((r) => s.once('listening', r));
     const url = `http://127.0.0.1:${(s.address() as AddressInfo).port}`;
@@ -105,7 +106,7 @@ describe('HTTP edge cases', () => {
 
   it('rejects unknown Host headers when ALLOWED_HOSTS is set', async () => {
     const app = createApp({
-      authToken: TOKEN,
+      tokens: tokenRegistry(TOKENS),
       allowedHosts: loadConfig({ MCP_AUTH_TOKEN: TOKEN, GOOGLE_APPLICATION_CREDENTIALS: 'x', ALLOWED_HOSTS: 'LOCALHOST:443, 127.0.0.1' }).ALLOWED_HOSTS,
       deps: { service: makeService(fakeApi()), logger: silentLogger, maxRowsPerCall: 25_000 },
       logger: silentLogger,
@@ -132,5 +133,46 @@ describe('HTTP edge cases', () => {
     } finally {
       await new Promise((r) => s.close(r));
     }
+  });
+});
+
+describe('several tokens', () => {
+  const OLD = 'old-token-0123456789abcdef0123456789abcdef';
+  const NEW = 'new-token-0123456789abcdef0123456789abcdef';
+  const body = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'list_sites', arguments: {} } });
+  const headers = (token: string) => ({ authorization: `Bearer ${token}`, 'content-type': 'application/json', accept: 'application/json, text/event-stream' });
+
+  it('accepts each token and logs which client sent the request, never the token', async () => {
+    const lines: { level: string; msg: string; fields?: Record<string, unknown> }[] = [];
+    const record = (level: string) => (msg: string, fields?: Record<string, unknown>) => void lines.push({ level, msg, fields });
+    const logger: Logger = { debug: record('debug'), info: record('info'), warn: record('warn'), error: record('error') };
+    const app = createApp({
+      tokens: tokenRegistry([
+        { label: 'grok-old', token: OLD },
+        { label: 'grok', token: NEW },
+      ]),
+      deps: { service: makeService(fakeApi()), logger: silentLogger, maxRowsPerCall: 25_000 },
+      logger,
+    });
+    const s = app.listen(0, '127.0.0.1');
+    await new Promise((r) => s.once('listening', r));
+    const url = `http://127.0.0.1:${(s.address() as AddressInfo).port}/mcp`;
+    try {
+      expect((await fetch(url, { method: 'POST', headers: headers(OLD), body })).status).toBe(200);
+      expect((await fetch(url, { method: 'POST', headers: headers(NEW), body })).status).toBe(200);
+      expect((await fetch(url, { method: 'POST', headers: headers(`${NEW}x`), body })).status).toBe(401);
+      expect((await fetch(url, { method: 'POST', headers: { 'content-type': 'application/json' }, body })).status).toBe(401);
+    } finally {
+      await new Promise((r) => s.close(r));
+    }
+    expect(lines.filter((l) => l.msg === 'mcp request').map((l) => l.fields)).toEqual([
+      { client: 'grok-old', method: 'tools/call', tool: 'list_sites' },
+      { client: 'grok', method: 'tools/call', tool: 'list_sites' },
+    ]);
+    expect(lines.filter((l) => l.msg === 'unauthorized request').map((l) => [l.level, l.fields])).toEqual([
+      ['warn', { reason: 'unknown token' }],
+      ['warn', { reason: 'no bearer token' }],
+    ]);
+    expect(JSON.stringify(lines)).not.toContain('0123456789abcdef');
   });
 });

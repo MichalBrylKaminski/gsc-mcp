@@ -13,6 +13,7 @@
     "build": "tsc -p tsconfig.build.json",
     "dev": "tsx watch src/index.ts",
     "start": "node dist/index.js",
+    "token": "tsx src/issueToken.ts",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest"

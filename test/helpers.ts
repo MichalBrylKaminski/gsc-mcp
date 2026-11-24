@@ -1,3 +1,5 @@
+import { TokenRegistry, type TokenRegistryOptions } from '../src/auth.js';
+import type { AuthToken } from '../src/config.js';
 import type { GscApi } from '../src/google/client.js';
 import { GscService, type GscServiceOptions } from '../src/google/service.js';
 import { silentLogger } from '../src/logger.js';
@@ -36,4 +38,9 @@ export function googleError(status: number, reason?: string, message = 'error', 
     status,
     response: { status, headers: new Headers(headers), data: { error: { code: status, message, errors: reason ? [{ reason, message }] : [] } } },
   });
+}
+
+/** Accepted tokens for createApp; auto-expire is off unless opts turn it on. */
+export function tokenRegistry(tokens: AuthToken[], opts: Partial<TokenRegistryOptions> = {}): TokenRegistry {
+  return new TokenRegistry(tokens, { autoExpire: false, logger: silentLogger, ...opts });
 }
