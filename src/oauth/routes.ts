@@ -4,7 +4,7 @@ import type { ClientInfo } from '../auth.js';
 import type { Logger } from '../logger.js';
 import { clearedSignInCookie, clientsRoutes, OwnerSessions, readCookie, SESSION_COOKIE, sessionCookie, SIGNIN_COOKIE } from './clients.js';
 import { consentPage, errorPage, sendPage } from './pages.js';
-import { safeReason, type GscOAuthProvider } from './provider.js';
+import { bindingMatches, safeReason, type GscOAuthProvider } from './provider.js';
 import { RateLimit } from './rateLimit.js';
 import type { OAuthStore } from './store.js';
 
@@ -49,12 +49,14 @@ export function oauthRouter(o: OAuthRouterOptions): express.Router {
   );
 
   router.get('/oauth/google/callback', async (req, res) => {
-    if (!callbacks.take(req.ip ?? 'unknown')) return sendPage(res, 429, errorPage('Too many sign-in attempts from this address. Wait ten minutes and try again.'));
+    const state = str(req.query.state);
     const binding = readCookie(req.headers.cookie, SIGNIN_COOKIE);
-    if (binding) res.append('Set-Cookie', clearedSignInCookie); // single use
+    // Single use, but only for its own sign-in: a client's sign-in in the same browser leaves it alone.
+    if (binding && state && bindingMatches(binding, state)) res.append('Set-Cookie', clearedSignInCookie);
     let ret;
     try {
-      ret = await o.provider.handleGoogleReturn({ state: str(req.query.state), code: str(req.query.code), error: str(req.query.error) }, binding);
+      // Only callbacks that would reach Google count toward the limit.
+      ret = await o.provider.handleGoogleReturn({ state, code: str(req.query.code), error: str(req.query.error) }, binding, () => callbacks.take(req.ip ?? 'unknown'));
     } catch (err) {
       o.logger.error('sign-in callback failed', { error: safeReason(err) });
       return sendPage(res, 500, errorPage('Sign-in failed. Start the connection again from your client.'));

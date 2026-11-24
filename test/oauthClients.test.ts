@@ -27,7 +27,7 @@ describe('Connected clients page', () => {
     expect(start.headers.get('location')).toMatch(/^https:\/\/google\.test\/auth\?state=/);
     const set = start.headers.getSetCookie();
     expect(set).toHaveLength(1);
-    expect(set[0]).toMatch(/^__Host-gsc_mcp_signin=[\w-]{40,}\.[\w-]{40,}; Path=\/; Max-Age=300; HttpOnly; Secure; SameSite=Lax$/);
+    expect(set[0]).toMatch(/^__Host-gsc_mcp_signin=[\w-]{40,}\.[\w-]{40,}\.\d+; Path=\/; Max-Age=300; HttpOnly; Secure; SameSite=Lax$/);
     return { signin: set[0]!.split(';')[0]!, state: app.g.lastState() };
   }
   const callback = (state: string, cookie?: string) =>
@@ -78,6 +78,12 @@ describe('Connected clients page', () => {
     const back = await callback(state, signin);
     expect(back.status).toBe(403);
     expect(back.headers.getSetCookie().some((c) => c.startsWith('__Host-gsc_mcp_session='))).toBe(false);
+  });
+
+  it('leaves the sign-in cookie alone on another sign-in\'s callback', async () => {
+    const { signin } = await startSignIn();
+    const other = await fetch(`${app.base}/oauth/google/callback?state=bogus&code=c`, { headers: { cookie: signin } });
+    expect(other.headers.getSetCookie()).toEqual([]);
   });
 
   it('binds the sign-in to the browser that started it', async () => {

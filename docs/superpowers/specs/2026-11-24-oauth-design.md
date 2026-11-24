@@ -82,7 +82,7 @@ The client name comes from registration and is chosen by the client: it is cut t
 
 - `GET /clients`: if there is no session, redirects through Google sign-in (same allowlist), then sets a session cookie (`__Host-gsc_mcp_session`): random id, kept in server memory, 12 hours, `HttpOnly; Secure; SameSite=Lax; Path=/`.
 - The sign-in for this page keeps nothing on the server: `GET /clients` puts its Google `state` and nonce in a 5-minute `__Host-gsc_mcp_signin` cookie (`HttpOnly; Secure; SameSite=Lax`), and the callback accepts the state only from the browser holding that cookie. Anonymous `GET /clients` requests therefore can't push out the owner's sign-in or fill the queue client sign-ins use.
-- `/oauth/google/callback` (which may call Google) is limited to 30 requests per 10 minutes per client address.
+- Callbacks that would call Google (a valid pending `state`, or a matching sign-in cookie) are limited to 30 per 10 minutes per client address; junk callbacks are rejected before Google and do not count. The sign-in cookie also carries its issue time, so the 5 minutes are checked on the server.
 - Lists each grant: client name, redirect host, approved on, expires on, last used. Lists fixed tokens read-only: name and expiry (or "never").
 - `POST /clients/revoke` (one grant) and `POST /clients/revoke-all`, each with the session's CSRF token. `POST /clients/sign-out` ends the session.
 

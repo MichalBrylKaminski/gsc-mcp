@@ -276,7 +276,7 @@ describe('GscOAuthProvider', () => {
     const p = setup();
     const s = p.provider.startSessionSignIn();
     expect(s.url).toMatch(/^https:\/\/google\.test\//);
-    expect(s.binding).toBe(`${p.g.lastState()}.${p.g.issued.at(-1)!.nonce}`);
+    expect(s.binding).toBe(`${p.g.lastState()}.${p.g.issued.at(-1)!.nonce}.${Date.now()}`);
     expect(await p.provider.handleGoogleReturn({ state: p.g.lastState(), code: 'c' })).toMatchObject({ kind: 'error', status: 400 });
     expect(await p.provider.handleGoogleReturn({ state: 'other', code: 'c' }, s.binding)).toMatchObject({ kind: 'error', status: 400 });
     expect(await p.provider.handleGoogleReturn({ state: p.g.lastState(), code: 'c' }, s.binding)).toEqual({ kind: 'session', email: 'owner@example.com' });
@@ -289,5 +289,25 @@ describe('GscOAuthProvider', () => {
     p.g.setNext(new Error('Google is down'));
     const s4 = p.provider.startSessionSignIn();
     expect(await p.provider.handleGoogleReturn({ state: p.g.lastState(), code: 'c' }, s4.binding)).toMatchObject({ kind: 'error', status: 502 });
+  });
+
+  it('expires a clients-page sign-in after 5 minutes on the server', async () => {
+    const p = setup();
+    const s = p.provider.startSessionSignIn();
+    vi.setSystemTime(new Date(Date.now() + 300_001));
+    expect(await p.provider.handleGoogleReturn({ state: p.g.lastState(), code: 'c' }, s.binding)).toMatchObject({ kind: 'error', status: 400 });
+    const forged = s.binding.replace(/\.\d+$/, '.notatime');
+    expect(await p.provider.handleGoogleReturn({ state: p.g.lastState(), code: 'c' }, forged)).toMatchObject({ kind: 'error', status: 400 });
+  });
+
+  it('asks the limiter only before calling Google', async () => {
+    const p = setup();
+    let asked = 0;
+    const deny = () => (asked++, false);
+    expect(await p.provider.handleGoogleReturn({ state: 'bogus', code: 'c' }, undefined, deny)).toMatchObject({ status: 400 });
+    expect(asked).toBe(0);
+    const s = p.provider.startSessionSignIn();
+    expect(await p.provider.handleGoogleReturn({ state: p.g.lastState(), code: 'c' }, s.binding, deny)).toMatchObject({ kind: 'error', status: 429 });
+    expect(asked).toBe(1);
   });
 });

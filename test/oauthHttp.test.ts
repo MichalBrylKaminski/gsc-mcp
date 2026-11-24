@@ -313,10 +313,17 @@ describe('OAuth mounting', () => {
   it('limits Google callbacks per address', async () => {
     const app = await startOAuthApp({ trustProxy: 1 });
     try {
-      const hit = (ip: string) => fetch(`${app.base}/oauth/google/callback?state=bogus&code=c`, { headers: { 'x-forwarded-for': ip } });
-      for (let i = 0; i < 30; i++) expect((await hit('203.0.113.7')).status).toBe(400);
-      expect((await hit('203.0.113.7')).status).toBe(429);
-      expect((await hit('198.51.100.1')).status).toBe(400);
+      // Junk callbacks never reach Google, so they don't count.
+      for (let i = 0; i < 40; i++) expect((await fetch(`${app.base}/oauth/google/callback?state=bogus&code=c`, { headers: { 'x-forwarded-for': '203.0.113.7' } })).status).toBe(400);
+      const signIn = async (ip: string) => {
+        const start = await fetch(`${app.base}/clients`, { redirect: 'manual', headers: { 'x-forwarded-for': ip } });
+        const cookie = start.headers.getSetCookie()[0]!.split(';')[0]!;
+        const state = new URL(start.headers.get('location')!).searchParams.get('state')!;
+        return fetch(`${app.base}/oauth/google/callback?state=${encodeURIComponent(state)}&code=${encodeURIComponent(state)}`, { redirect: 'manual', headers: { cookie, 'x-forwarded-for': ip } });
+      };
+      for (let i = 0; i < 30; i++) expect((await signIn('203.0.113.7')).status).toBe(302);
+      expect((await signIn('203.0.113.7')).status).toBe(429);
+      expect((await signIn('198.51.100.1')).status).toBe(302);
     } finally {
       await app.close();
     }

@@ -19,7 +19,7 @@ export type GoogleReturn =
   | { kind: 'consent'; consentId: string; csrf: string; clientName: string; redirectHost: string; expiresOn: string }
   | { kind: 'session'; email: string }
   | { kind: 'redirect'; url: string }
-  | { kind: 'error'; status: 400 | 403 | 502; message: string };
+  | { kind: 'error'; status: 400 | 403 | 429 | 502; message: string };
 
 type Pending =
   | { kind: 'authorize'; clientId: string; params: AuthorizationParams; nonce: string; expiresAt: number }
@@ -79,6 +79,12 @@ export function redirectTarget(redirectUri: string): string {
   return url.host ? `${url.protocol}//${url.host}` : url.protocol;
 }
 
+/** Whether a clients-page sign-in cookie belongs to this Google `state`. */
+export function bindingMatches(binding: string, state: string): boolean {
+  const parts = binding.split('.');
+  return parts.length === 3 && !!parts[1] && /^\d+$/.test(parts[2]!) && sameSecret(parts[0]!, state);
+}
+
 /** Adds OAuth response parameters to a client's redirect URI. */
 function redirectWith(redirectUri: string, params: Record<string, string | undefined>): string {
   const url = new URL(redirectUri);
@@ -136,18 +142,20 @@ export class GscOAuthProvider implements OAuthServerProvider {
   startSessionSignIn(): SessionSignIn {
     const state = random();
     const nonce = random();
-    return { url: this.o.google.authUrl(state, nonce), binding: `${state}.${nonce}` };
+    return { url: this.o.google.authUrl(state, nonce), binding: `${state}.${nonce}.${Date.now()}` };
   }
 
   /**
    * Handles Google's redirect back to /oauth/google/callback. `binding` is the
-   * clients-page sign-in cookie, if the browser has one.
+   * clients-page sign-in cookie, if the browser has one. `admit` is asked just
+   * before Google is called (a rate limit); false answers with a 429.
    */
-  async handleGoogleReturn(q: { state?: string; code?: string; error?: string }, binding?: string): Promise<GoogleReturn> {
+  async handleGoogleReturn(q: { state?: string; code?: string; error?: string }, binding?: string, admit: () => boolean = () => true): Promise<GoogleReturn> {
     let p: Pending | undefined = this.take(this.pending, q.state);
-    if (!p && binding && q.state) {
-      const [state, nonce] = binding.split('.');
-      if (state && nonce && sameSecret(state, q.state)) p = { kind: 'session', nonce, expiresAt: Infinity };
+    if (!p && binding && q.state && bindingMatches(binding, q.state)) {
+      const [, nonce, issuedAt] = binding.split('.');
+      p = { kind: 'session', nonce: nonce!, expiresAt: Number(issuedAt) + PENDING_TTL_MS };
+      if (!(Date.now() < p.expiresAt)) p = undefined;
     }
     if (!p) return { kind: 'error', status: 400, message: STALE };
     const params = p.kind === 'authorize' ? p.params : undefined;
@@ -159,6 +167,7 @@ export class GscOAuthProvider implements OAuthServerProvider {
     };
     if (q.error || !q.code) return denied((q.error ?? 'no code from Google').slice(0, 64));
 
+    if (!admit()) return { kind: 'error', status: 429, message: 'Too many sign-in attempts from this address. Wait ten minutes and try again.' };
     let identity;
     try {
       identity = await this.o.google.verify(q.code);
