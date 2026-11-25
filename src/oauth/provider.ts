@@ -1,5 +1,5 @@
 import type { OAuthRegisteredClientsStore } from '@modelcontextprotocol/sdk/server/auth/clients.js';
-import { InvalidGrantError, InvalidTokenError, TooManyRequestsError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
+import { InvalidGrantError, InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import type { AuthorizationParams, OAuthServerProvider } from '@modelcontextprotocol/sdk/server/auth/provider.js';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import type { OAuthClientInformationFull, OAuthTokenRevocationRequest, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
@@ -7,13 +7,19 @@ import type { Response } from 'express';
 import { expiryDayFor } from '../auth.js';
 import type { Logger } from '../logger.js';
 import type { GoogleSignIn } from './google.js';
-import { randomSecret as random, sameSecret } from './secrets.js';
+import { randomSecret as random, sameSecret } from '../secrets.js';
 import { cleanClientName, grantLabel, type OAuthStore } from './store.js';
 
 /** How long a started sign-in, a consent page and an authorization code stay usable. */
 export const PENDING_TTL_MS = 300_000;
-/** Cap on in-flight client sign-ins, so /authorize spam can't grow memory without bound. */
+/**
+ * Caps on in-flight sign-ins, consent pages and codes, so /authorize spam can't
+ * grow memory without bound. Past a cap the oldest entry is dropped rather than
+ * the new one refused, so a flood can't lock the owner out: it would have to
+ * outpace the owner's own sign-in, and one client can hold only a few.
+ */
 const MAX_PENDING = 1000;
+const MAX_PENDING_PER_CLIENT = 20;
 
 export type GoogleReturn =
   | { kind: 'consent'; consentId: string; csrf: string; clientName: string; redirectHost: string; expiresOn: string }
@@ -21,9 +27,7 @@ export type GoogleReturn =
   | { kind: 'redirect'; url: string }
   | { kind: 'error'; status: 400 | 403 | 429 | 502; message: string };
 
-type Pending =
-  | { kind: 'authorize'; clientId: string; params: AuthorizationParams; nonce: string; expiresAt: number }
-  | { kind: 'session'; nonce: string; expiresAt: number };
+type Pending = { clientId: string; params: AuthorizationParams; nonce: string; expiresAt: number };
 
 /**
  * A sign-in for the Connected clients page, bound to the browser that started
@@ -115,11 +119,16 @@ export class GscOAuthProvider implements OAuthServerProvider {
     };
   }
 
-  /** Drops expired entries; refuses new ones past the cap. */
-  private sweep<T extends { expiresAt: number }>(map: Map<string, T>): void {
+  /**
+   * Makes room for one more entry: drops expired ones, then the oldest while
+   * `limit` or more match `counts` (all entries by default). Entries share one
+   * TTL, so insertion order is age order.
+   */
+  private makeRoom<T extends { expiresAt: number }>(map: Map<string, T>, limit = MAX_PENDING, counts: (v: T) => boolean = () => true): void {
     const now = Date.now();
     for (const [k, v] of map) if (now >= v.expiresAt) map.delete(k);
-    if (map.size >= MAX_PENDING) throw new TooManyRequestsError('Too many sign-ins are in progress; try again in a few minutes.');
+    const matching = [...map].filter(([, v]) => counts(v));
+    for (let i = 0; matching.length - i >= limit; i++) map.delete(matching[i]![0]);
   }
 
   /** Takes a single-use entry: it is deleted whether or not it is still valid. */
@@ -131,10 +140,11 @@ export class GscOAuthProvider implements OAuthServerProvider {
   }
 
   async authorize(client: OAuthClientInformationFull, params: AuthorizationParams, res: Response): Promise<void> {
-    this.sweep(this.pending);
+    this.makeRoom(this.pending, MAX_PENDING_PER_CLIENT, (v) => v.clientId === client.client_id);
+    this.makeRoom(this.pending);
     const state = random();
     const nonce = random();
-    this.pending.set(state, { kind: 'authorize', clientId: client.client_id, params, nonce, expiresAt: Date.now() + PENDING_TTL_MS });
+    this.pending.set(state, { clientId: client.client_id, params, nonce, expiresAt: Date.now() + PENDING_TTL_MS });
     res.redirect(302, this.o.google.authUrl(state, nonce));
   }
 
@@ -151,19 +161,21 @@ export class GscOAuthProvider implements OAuthServerProvider {
    * before Google is called (a rate limit); false answers with a 429.
    */
   async handleGoogleReturn(q: { state?: string; code?: string; error?: string }, binding?: string, admit: () => boolean = () => true): Promise<GoogleReturn> {
-    let p: Pending | undefined = this.take(this.pending, q.state);
-    if (!p && binding && q.state && bindingMatches(binding, q.state)) {
-      const [, nonce, issuedAt] = binding.split('.');
-      p = { kind: 'session', nonce: nonce!, expiresAt: Number(issuedAt) + PENDING_TTL_MS };
-      if (!(Date.now() < p.expiresAt)) p = undefined;
+    const pending = this.take(this.pending, q.state);
+    let nonce = pending?.nonce;
+    if (!pending && binding && q.state && bindingMatches(binding, q.state)) {
+      const [, boundNonce, issuedAt] = binding.split('.');
+      if (Date.now() < Number(issuedAt) + PENDING_TTL_MS) nonce = boundNonce;
     }
-    if (!p) return { kind: 'error', status: 400, message: STALE };
-    const params = p.kind === 'authorize' ? p.params : undefined;
+    if (nonce === undefined) return { kind: 'error', status: 400, message: STALE };
+    const params = pending?.params;
+    /** Ends the sign-in: a client gets an OAuth error at its redirect URI (it is waiting for one), the clients page an error page. */
+    const fail = (status: 403 | 502, page: string, error: string, description: string): GoogleReturn =>
+      params ? { kind: 'redirect', url: redirectWith(params.redirectUri, { error, error_description: description, state: params.state }) } : { kind: 'error', status, message: page };
     const denied = (reason: string, email?: string): GoogleReturn => {
       if (email !== undefined) this.o.logger.warn('sign-in refused', { email, reason });
       else this.o.logger.warn('sign-in cancelled', { reason });
-      if (!params) return { kind: 'error', status: 403, message: 'Sign-in was refused or cancelled.' };
-      return { kind: 'redirect', url: redirectWith(params.redirectUri, { error: 'access_denied', error_description: 'The server owner did not approve this client.', state: params.state }) };
+      return fail(403, 'Sign-in was refused or cancelled.', 'access_denied', 'The server owner did not approve this client.');
     };
     if (q.error || !q.code) return denied((q.error ?? 'no code from Google').slice(0, 64));
 
@@ -172,24 +184,24 @@ export class GscOAuthProvider implements OAuthServerProvider {
     try {
       identity = await this.o.google.verify(q.code);
     } catch (err) {
-      // Google may be down, or the code was made up; either way tell the client, which is waiting.
+      // Google may be down, or the code was made up.
       this.o.logger.warn('Google sign-in failed', { error: safeReason(err) });
-      if (!params) return { kind: 'error', status: 502, message: 'Google sign-in failed. Open the Connected clients page again.' };
-      return { kind: 'redirect', url: redirectWith(params.redirectUri, { error: 'temporarily_unavailable', error_description: 'Google sign-in failed; try again.', state: params.state }) };
+      return fail(502, 'Google sign-in failed. Open the Connected clients page again.', 'temporarily_unavailable', 'Google sign-in failed; try again.');
     }
-    if (identity.nonce === undefined || !sameSecret(identity.nonce, p.nonce)) {
+    if (identity.nonce === undefined || !sameSecret(identity.nonce, nonce)) {
       this.o.logger.warn('Google sign-in failed', { error: 'nonce mismatch' });
-      return { kind: 'error', status: 400, message: 'Google sign-in failed. Start the connection again from your client.' };
+      return fail(403, 'Google sign-in could not be verified. Open the Connected clients page again.', 'access_denied', 'Google sign-in could not be verified; try again.');
     }
     const email = identity.email.trim().toLowerCase();
     if (!identity.emailVerified) return denied('email not verified', identity.email);
     if (!this.allowed.has(email)) return denied('email not allowed', identity.email);
 
-    if (p.kind === 'session') return { kind: 'session', email };
+    if (!pending) return { kind: 'session', email };
 
+    const p = pending;
     const client = this.o.store.getClient(p.clientId);
     if (!client) return { kind: 'error', status: 400, message: 'This client is no longer registered. Start the connection again from your client.' };
-    this.sweep(this.consents);
+    this.makeRoom(this.consents);
     const consentId = random();
     const consent: Consent = { csrf: random(), expiresOn: expiryDayFor(this.o.ttlDays), clientId: client.client_id, clientName: cleanClientName(client.client_name), params: p.params, email, expiresAt: Date.now() + PENDING_TTL_MS };
     this.consents.set(consentId, consent);
@@ -218,11 +230,7 @@ export class GscOAuthProvider implements OAuthServerProvider {
       return { kind: 'redirect', url: redirectWith(redirectUri, { error: 'access_denied', error_description: 'The server owner denied this client.', state }) };
     }
     if (!this.o.store.getClient(c.clientId)) return { kind: 'error', status: 400, message: 'This client is no longer registered. Start the connection again from your client.' };
-    try {
-      this.sweep(this.codes);
-    } catch {
-      return { kind: 'error', status: 400, message: 'Too many sign-ins are in progress; try again in a few minutes.' };
-    }
+    this.makeRoom(this.codes);
     const code = random();
     this.codes.set(code, { clientId: c.clientId, clientName: c.clientName, email: c.email, expiresOn: c.expiresOn, redirectUri, challenge: codeChallenge, expiresAt: Date.now() + PENDING_TTL_MS });
     this.o.logger.info('client approved', { clientName: c.clientName, clientId: c.clientId, email: c.email, redirectHost: redirectTarget(redirectUri) });
@@ -235,18 +243,28 @@ export class GscOAuthProvider implements OAuthServerProvider {
     return c.challenge;
   }
 
+  /**
+   * RFC 6749 4.1.3: redirect_uri must match the authorization request. The SDK
+   * fills it in at /authorize when a client with one registered URI leaves it
+   * out, so it may be omitted here only when the code went to that one URI.
+   */
   async exchangeAuthorizationCode(client: OAuthClientInformationFull, authorizationCode: string, _codeVerifier?: string, redirectUri?: string): Promise<OAuthTokens> {
     const c = this.take(this.codes, authorizationCode);
     if (!c || c.clientId !== client.client_id) throw new InvalidGrantError('Invalid or expired authorization code.');
-    if (redirectUri !== undefined && redirectUri !== c.redirectUri) throw new InvalidGrantError('redirect_uri does not match the authorization request.');
+    const implied = client.redirect_uris.length === 1 && client.redirect_uris[0] === c.redirectUri;
+    if (redirectUri === undefined ? !implied : redirectUri !== c.redirectUri) throw new InvalidGrantError('redirect_uri does not match the authorization request.');
     if (!this.o.store.getClient(c.clientId)) throw new InvalidGrantError('This client is no longer registered.');
     const grant = this.o.store.createGrant({ clientId: c.clientId, clientName: c.clientName, email: c.email, redirectHost: redirectTarget(c.redirectUri), expiresOn: c.expiresOn });
     this.o.logger.info('client connected', { client: grantLabel(grant), email: grant.email, redirectHost: grant.redirectHost, expiresAt: grant.expiresAt });
-    return this.o.store.issueTokens(grant.id);
+    const tokens = this.o.store.issueTokens(grant.id);
+    await this.o.store.flush(); // on disk before the client gets them, so a crash can't forget them
+    return tokens;
   }
 
   async exchangeRefreshToken(client: OAuthClientInformationFull, refreshToken: string): Promise<OAuthTokens> {
-    return this.o.store.refresh(client.client_id, refreshToken);
+    const tokens = this.o.store.refresh(client.client_id, refreshToken);
+    await this.o.store.flush(); // the old refresh token is spent; the new one must survive a crash
+    return tokens;
   }
 
   /**

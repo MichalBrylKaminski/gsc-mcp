@@ -1,5 +1,5 @@
 import { join } from 'node:path';
-import { DAY_MS, TokenRegistry } from './auth.js';
+import { TokenRegistry } from './auth.js';
 import { loadConfig } from './config.js';
 import { createGscApi, readServiceAccountKey } from './google/client.js';
 import { GscService } from './google/service.js';
@@ -46,7 +46,6 @@ async function main() {
       router: oauthRouter({ provider, publicUrl, mcpPath: config.MCP_PATH, store, fixedClients: () => tokens.clients(), logger }),
     };
     oauthStore = store;
-    setInterval(() => store.prune(), DAY_MS).unref();
     if (config.TRUST_PROXY === undefined) logger.warn('TRUST_PROXY is not set; rate limits will see the proxy as the client');
   }
 

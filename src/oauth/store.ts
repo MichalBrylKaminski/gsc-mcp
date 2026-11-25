@@ -1,13 +1,18 @@
-import { createHash, randomBytes, randomUUID } from 'node:crypto';
-import { readFileSync, renameSync } from 'node:fs';
+import { randomBytes, randomUUID } from 'node:crypto';
 import { InvalidClientMetadataError, InvalidGrantError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 import { DAY_MS, EXPIRY_WARNING_DAYS, expiryDayFor, expiryMs, utcDay, type ClientInfo } from '../auth.js';
 import { JsonFile } from '../limits/limiter.js';
-import { randomSecret } from './secrets.js';
 import type { Logger } from '../logger.js';
+import { randomSecret, sha256Hex as sha256 } from '../secrets.js';
 
 export const ACCESS_TOKEN_TTL_MS = 3_600_000;
+/**
+ * A client may present its previous refresh token again for this long after
+ * exchanging it (its response was lost, or two copies of it refreshed at once)
+ * and get a new pair, instead of having the grant revoked as a copied token.
+ */
+export const REFRESH_REUSE_GRACE_MS = 60_000;
 /** A registered client that never got a grant is forgotten after this long. */
 export const UNUSED_CLIENT_TTL_MS = 86_400_000;
 export const MAX_CLIENTS = 100;
@@ -49,7 +54,9 @@ interface StoredGrant {
   accessHash?: string;
   accessExpiresAt?: number;
   refreshHash?: string;
-  /** Refresh tokens already exchanged; seeing one again means it was copied. */
+  /** When a refresh token was last exchanged, for REFRESH_REUSE_GRACE_MS. */
+  refreshedAt?: number;
+  /** Refresh tokens already exchanged, oldest first; seeing one again means it was copied. */
   usedRefreshHashes: string[];
 }
 
@@ -69,8 +76,6 @@ export interface OAuthStoreOptions {
   logger: Logger;
 }
 
-const sha256 = (s: string) => createHash('sha256').update(s).digest('hex');
-const newToken = randomSecret;
 const iso = (ms: number) => new Date(ms).toISOString();
 
 const isStr = (v: unknown): v is string => typeof v === 'string' && v.length > 0;
@@ -91,6 +96,7 @@ function validGrant(g: unknown): g is StoredGrant {
     (x.lastUsedAt === undefined || isTime(x.lastUsedAt)) &&
     (x.accessHash === undefined || (isStr(x.accessHash) && isTime(x.accessExpiresAt))) &&
     (x.refreshHash === undefined || isStr(x.refreshHash)) &&
+    (x.refreshedAt === undefined || isTime(x.refreshedAt)) &&
     Array.isArray(x.usedRefreshHashes) &&
     x.usedRefreshHashes.every(isStr)
   );
@@ -119,53 +125,37 @@ export class OAuthStore {
   private readonly warnedOn = new Map<string, string>();
   private readonly file: JsonFile<State>;
   private lastUsedDirty = false;
-  private readonly timer: NodeJS.Timeout;
+  private readonly timers: NodeJS.Timeout[];
 
   constructor(private readonly opts: OAuthStoreOptions) {
-    this.file = new JsonFile<State>(opts.file, 'OAuth state', opts.logger);
+    this.file = new JsonFile<State>(opts.file, 'OAuth state', opts.logger, { setAsideCorrupt: true });
     this.load();
     this.prune();
-    this.timer = setInterval(() => {
-      if (this.lastUsedDirty) this.save();
-    }, LAST_USED_FLUSH_MS);
-    this.timer.unref();
+    this.timers = [
+      setInterval(() => {
+        if (this.lastUsedDirty) this.save();
+      }, LAST_USED_FLUSH_MS),
+      setInterval(() => this.prune(), DAY_MS),
+    ];
+    for (const t of this.timers) t.unref();
   }
 
   private load(): void {
-    const path = this.opts.file;
-    if (!path) return;
-    let text: string;
-    try {
-      text = readFileSync(path, 'utf8');
-    } catch (err) {
-      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
-      this.opts.logger.error('OAuth state unreadable; starting with no sign-ins', { file: path, error: (err as Error).message });
-      return;
+    const state = this.file.read((s) => {
+      const x = s as State | null;
+      return x?.version === 1 && Array.isArray(x.clients) && Array.isArray(x.grants);
+    });
+    if (!state) return;
+    let dropped = 0;
+    for (const c of state.clients as unknown[]) {
+      if (validClient(c)) this.clients.set(c.client_id, c);
+      else dropped++;
     }
-    try {
-      const state = JSON.parse(text) as State;
-      if (state?.version !== 1 || !Array.isArray(state.clients) || !Array.isArray(state.grants)) throw new Error('unexpected format');
-      let dropped = 0;
-      for (const c of state.clients as unknown[]) {
-        if (validClient(c)) this.clients.set(c.client_id, c);
-        else dropped++;
-      }
-      for (const g of state.grants as unknown[]) {
-        if (validGrant(g) && this.clients.has(g.clientId)) this.index(g);
-        else dropped++;
-      }
-      if (dropped) this.opts.logger.warn('dropped malformed OAuth state entries', { file: path, dropped });
-    } catch (err) {
-      const aside = `${path}.corrupt-${Date.now()}`;
-      try {
-        renameSync(path, aside);
-      } catch {
-        // If it can't be moved, the next save overwrites it.
-      }
-      this.clients.clear();
-      for (const m of [this.grantsById, this.byAccess, this.byRefresh, this.byUsedRefresh]) m.clear();
-      this.opts.logger.error('OAuth state is corrupt; set aside, starting with no sign-ins', { file: path, movedTo: aside, error: (err as Error).message });
+    for (const g of state.grants as unknown[]) {
+      if (validGrant(g) && this.clients.has(g.clientId)) this.index(g);
+      else dropped++;
     }
+    if (dropped) this.opts.logger.warn('dropped malformed OAuth state entries', { file: this.opts.file, dropped });
   }
 
   private index(g: StoredGrant): void {
@@ -254,8 +244,8 @@ export class OAuthStore {
   private rotate(g: StoredGrant): IssuedTokens {
     if (g.accessHash) this.byAccess.delete(g.accessHash);
     if (g.refreshHash) this.byRefresh.delete(g.refreshHash);
-    const access = newToken();
-    const refresh = newToken();
+    const access = randomSecret();
+    const refresh = randomSecret();
     const now = Date.now();
     g.accessHash = sha256(access);
     g.accessExpiresAt = Math.min(now + ACCESS_TOKEN_TTL_MS, g.expiresAt);
@@ -269,21 +259,33 @@ export class OAuthStore {
   /**
    * Exchanges a refresh token for a new pair. Each refresh token works once;
    * one that comes back after use was copied, so the whole grant is revoked.
+   * The exception: the token exchanged last, presented again by its own client
+   * within REFRESH_REUSE_GRACE_MS, gets another new pair (the previous one
+   * stops working). The grace period is not extended by using it.
+   * Callers handing the tokens out should await flush() first, so a crash
+   * can't forget the new refresh token.
    */
   refresh(clientId: string, refreshToken: string): IssuedTokens {
     const hash = sha256(refreshToken);
+    const now = Date.now();
     const reused = this.byUsedRefresh.get(hash);
     if (reused) {
-      this.opts.logger.error('refresh token reused', { client: this.label(reused), note: 'the grant was revoked; the client must sign in again' });
+      const repeat = reused.clientId === clientId && reused.usedRefreshHashes.at(-1) === hash && reused.refreshedAt !== undefined && now - reused.refreshedAt < REFRESH_REUSE_GRACE_MS;
+      if (repeat && now < reused.expiresAt) {
+        this.opts.logger.warn('refresh token presented again within the grace period; issued a new pair', { client: grantLabel(reused) });
+        return this.rotate(reused);
+      }
+      this.opts.logger.error('refresh token reused', { client: grantLabel(reused), note: 'the grant was revoked; the client must sign in again' });
       this.removeGrant(reused);
       throw new InvalidGrantError('This refresh token was already used. The sign-in was revoked; sign in again.');
     }
     const g = this.byRefresh.get(hash);
     if (!g || g.clientId !== clientId) throw new InvalidGrantError('Unknown refresh token.');
-    if (Date.now() >= g.expiresAt) {
+    if (now >= g.expiresAt) {
       this.removeGrant(g);
       throw new InvalidGrantError('The sign-in has ended; sign in again.');
     }
+    g.refreshedAt = now;
     g.usedRefreshHashes.push(hash);
     this.byUsedRefresh.set(hash, g);
     // Keep the most recent ones; an older copied token is still useless, just not detected as reuse.
@@ -298,7 +300,7 @@ export class OAuthStore {
     if (!g || g.accessExpiresAt === undefined || now >= g.accessExpiresAt || now >= g.expiresAt) return undefined;
     g.lastUsedAt = now;
     this.lastUsedDirty = true;
-    const client: ClientInfo = { name: this.label(g), expiresAt: iso(g.expiresAt), daysLeft: Math.ceil((g.expiresAt - now) / DAY_MS), signIn: true };
+    const client: ClientInfo = { name: grantLabel(g), expiresAt: iso(g.expiresAt), daysLeft: Math.ceil((g.expiresAt - now) / DAY_MS), signIn: true };
     if (client.daysLeft! <= EXPIRY_WARNING_DAYS && this.warnedOn.get(g.id) !== utcDay(now)) {
       this.warnedOn.set(g.id, utcDay(now));
       this.opts.logger.warn('sign-in expires soon', { client: client.name, expiresAt: client.expiresAt, daysLeft: client.daysLeft });
@@ -313,11 +315,12 @@ export class OAuthStore {
     if (g && (clientId === undefined || g.clientId === clientId)) this.removeGrant(g);
   }
 
-  revokeGrant(id: string): boolean {
+  /** The revoked grant, or undefined if there was none with this id. */
+  revokeGrant(id: string): GrantView | undefined {
     const g = this.grantsById.get(id);
-    if (!g) return false;
+    if (!g) return undefined;
     this.removeGrant(g);
-    return true;
+    return this.view(g);
   }
 
   revokeAll(): number {
@@ -336,12 +339,16 @@ export class OAuthStore {
     if (save) this.save();
   }
 
-  /** Newest first. */
+  /** Live grants, newest first. Expired ones no longer work and are dropped by the next prune. */
   grants(): GrantView[] {
-    return [...this.grantsById.values()].sort((a, b) => b.createdAt - a.createdAt).map((g) => this.view(g));
+    const now = Date.now();
+    return [...this.grantsById.values()]
+      .filter((g) => now < g.expiresAt)
+      .sort((a, b) => b.createdAt - a.createdAt)
+      .map((g) => this.view(g));
   }
 
-  /** Drops expired grants, and clients that registered over a day ago and have no grant. */
+  /** Drops expired grants, and clients that registered over a day ago and have no grant. Runs daily on its own. */
   prune(): void {
     const now = Date.now();
     let changed = false;
@@ -367,13 +374,9 @@ export class OAuthStore {
     await this.file.flush();
   }
 
-  /** Stops the periodic save; call on shutdown after flush(). */
+  /** Stops the periodic save and prune; call on shutdown after flush(). */
   close(): void {
-    clearInterval(this.timer);
-  }
-
-  private label(g: StoredGrant): string {
-    return grantLabel(g);
+    for (const t of this.timers) clearInterval(t);
   }
 
   private view(g: StoredGrant): GrantView {

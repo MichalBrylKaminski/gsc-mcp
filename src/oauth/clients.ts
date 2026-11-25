@@ -3,7 +3,7 @@ import type { ClientInfo } from '../auth.js';
 import type { Logger } from '../logger.js';
 import { errorPage, escapeHtml, page, sendPage } from './pages.js';
 import type { GscOAuthProvider } from './provider.js';
-import { randomSecret as random, sameSecret } from './secrets.js';
+import { randomSecret as random, sameSecret } from '../secrets.js';
 import { grantLabel, type GrantView, type OAuthStore } from './store.js';
 
 export const SESSION_TTL_MS = 43_200_000;
@@ -143,10 +143,8 @@ export function clientsRoutes(o: ClientsRoutesOptions): express.Router {
 
   post('/clients/revoke', (body, session) => {
     const grantId = typeof body.grantId === 'string' ? body.grantId : '';
-    const grant = o.store.grants().find((g) => g.id === grantId);
-    if (grant && o.store.revokeGrant(grantId)) {
-      o.logger.info('grant revoked', { client: grantLabel(grant), by: session.email });
-    }
+    const grant = o.store.revokeGrant(grantId);
+    if (grant) o.logger.info('grant revoked', { client: grantLabel(grant), by: session.email });
   });
   post('/clients/revoke-all', (_body, session) => {
     o.logger.info('all grants revoked', { count: o.store.revokeAll(), by: session.email });

@@ -70,11 +70,51 @@ describe('OAuthStore grants', () => {
     const { store, client, grant } = setup({ logger });
     const t1 = store.issueTokens(grant.id);
     const t2 = store.refresh(client.client_id, t1.refresh_token);
+    vi.setSystemTime(new Date(Date.parse(NOW) + 60_000));
     expect(() => store.refresh(client.client_id, t1.refresh_token)).toThrow(InvalidGrantError);
     expect(store.grants()).toEqual([]);
     expect(store.verifyAccess(t2.access_token)).toBeUndefined();
     expect(() => store.refresh(client.client_id, t2.refresh_token)).toThrow(InvalidGrantError);
     expect(calls).toContainEqual(expect.objectContaining({ level: 'error', msg: 'refresh token reused' }));
+  });
+
+  it('a repeat of the last refresh within 60 s gets a new pair instead of revoking', () => {
+    const { logger, calls } = spyLogger();
+    const { store, client, grant } = setup({ logger });
+    const t1 = store.issueTokens(grant.id);
+    const t2 = store.refresh(client.client_id, t1.refresh_token);
+    vi.setSystemTime(new Date(Date.parse(NOW) + 59_000));
+    const t3 = store.refresh(client.client_id, t1.refresh_token);
+    expect(store.grants()).toHaveLength(1);
+    expect(store.verifyAccess(t2.access_token)).toBeUndefined();
+    expect(() => store.refresh(client.client_id, t2.refresh_token)).toThrow(InvalidGrantError); // replaced, not spent: no revoke
+    expect(store.verifyAccess(t3.access_token)).toBeDefined();
+    expect(calls).toContainEqual(expect.objectContaining({ level: 'warn', msg: 'refresh token presented again within the grace period; issued a new pair' }));
+    // The grace period runs from the real refresh; repeats don't extend it.
+    vi.setSystemTime(new Date(Date.parse(NOW) + 60_000));
+    expect(() => store.refresh(client.client_id, t1.refresh_token)).toThrow(InvalidGrantError);
+    expect(store.grants()).toEqual([]);
+  });
+
+  it('no grace for an older refresh token or another client', () => {
+    const { store, client, grant } = setup();
+    const t1 = store.issueTokens(grant.id);
+    const t2 = store.refresh(client.client_id, t1.refresh_token);
+    store.refresh(client.client_id, t2.refresh_token);
+    expect(() => store.refresh(client.client_id, t1.refresh_token)).toThrow(InvalidGrantError);
+    expect(store.grants()).toEqual([]);
+
+    const again = setup({ file: join(dir, 'other.json') });
+    const u1 = again.store.issueTokens(again.grant.id);
+    again.store.refresh(again.client.client_id, u1.refresh_token);
+    expect(() => again.store.refresh('someone-else', u1.refresh_token)).toThrow(InvalidGrantError);
+    expect(again.store.grants()).toEqual([]);
+  });
+
+  it('lists only live grants', () => {
+    const { store } = setup();
+    vi.setSystemTime(new Date('2027-02-22T00:00:00Z'));
+    expect(store.grants()).toEqual([]);
   });
 
   it('refresh by another client or after grant expiry fails', () => {
@@ -114,8 +154,8 @@ describe('OAuthStore grants', () => {
   it('revokeGrant and revokeAll', () => {
     const { store, grant } = setup();
     store.createGrant({ clientId: 'client-1', clientName: 'Grok', email: 'o@x.dev', redirectHost: 'x' });
-    expect(store.revokeGrant('nope')).toBe(false);
-    expect(store.revokeGrant(grant.id)).toBe(true);
+    expect(store.revokeGrant('nope')).toBeUndefined();
+    expect(store.revokeGrant(grant.id)).toMatchObject({ id: grant.id, clientName: 'Grok' });
     expect(store.grants()).toHaveLength(1);
     expect(store.revokeAll()).toBe(1);
     expect(store.grants()).toEqual([]);
@@ -263,6 +303,7 @@ describe('OAuthStore persistence', () => {
     store.refresh(client.client_id, t1.refresh_token);
     await store.flush();
     const again = new OAuthStore({ file, ttlDays: 90, logger: silentLogger });
+    vi.setSystemTime(new Date(Date.parse(NOW) + 60_000));
     expect(() => again.refresh(client.client_id, t1.refresh_token)).toThrow(InvalidGrantError);
     expect(again.grants()).toEqual([]);
   });
@@ -285,6 +326,25 @@ describe('OAuthStore persistence', () => {
     expect(store.grants()).toEqual([]);
     expect(readdirSync(dir).filter((f) => f.startsWith('oauth-state.json.corrupt-'))).toHaveLength(1);
     expect(calls).toContainEqual(expect.objectContaining({ level: 'error' }));
+  });
+
+  it('sets aside JSON in an unexpected format', () => {
+    writeFileSync(file, '{"version":2}');
+    const { logger, calls } = spyLogger();
+    new OAuthStore({ file, ttlDays: 90, logger });
+    expect(readdirSync(dir).filter((f) => f.startsWith('oauth-state.json.corrupt-'))).toHaveLength(1);
+    expect(calls).toContainEqual(expect.objectContaining({ level: 'error', msg: 'OAuth state is corrupt; set aside, starting fresh' }));
+  });
+
+  it('prunes on its own once a day', () => {
+    vi.useFakeTimers({ toFake: ['Date', 'setInterval', 'clearInterval'] });
+    vi.setSystemTime(new Date('2027-02-20T12:00:00Z'));
+    const { store } = setup();
+    store.createGrant({ clientId: 'client-1', clientName: 'Short', email: 'o@x.dev', redirectHost: 'x', expiresOn: '2027-02-21' });
+    vi.advanceTimersByTime(86_400_000);
+    expect(store.grants().map((g) => g.clientName)).toEqual(['Grok']);
+    expect((store as unknown as { grantsById: Map<string, unknown> }).grantsById.size).toBe(1);
+    store.close();
   });
 
   it('drops malformed entries and keeps good ones', async () => {

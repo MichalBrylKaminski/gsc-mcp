@@ -17,7 +17,7 @@ A client (Grok Bot for weekly checks, Claude Code while writing articles) gets i
 | Sign-in lifetime | Fixed from approval: expires at 00:00 UTC on (approval day + `MCP_AUTH_TOKEN_TTL_DAYS`), the same calculation as `issueToken`. Refreshing never extends it. |
 | Managing access | A "Connected clients" web page behind the same Google sign-in, with Revoke and Revoke all. |
 
-Why this answers the leak question: issuing anything requires a Google sign-in by an allowed account (protected by the owner's Google 2FA) plus a consent click. Nothing stored by a client or on the server can be traded for a new sign-in. A leaked access token lives at most 1 hour; a leaked refresh token is single-use, and its reuse revokes the whole grant.
+Why this answers the leak question: issuing anything requires a Google sign-in by an allowed account (protected by the owner's Google 2FA) plus a consent click. Nothing stored by a client or on the server can be traded for a new sign-in. A leaked access token lives at most 1 hour; a leaked refresh token is single-use, and its reuse revokes the whole grant (after a 60-second grace period for the client's own retry).
 
 ## Architecture
 
@@ -37,12 +37,12 @@ All pieces live in the existing app, which owns the whole `saturn.brylex-it.dev`
 
 1. The client POSTs to `/gsc-mcp` without a token and receives 401 with `WWW-Authenticate: Bearer resource_metadata="<metadata URL>"`.
 2. The client reads the metadata and registers at `/register`. Registration alone grants nothing.
-3. The client opens the browser at `/authorize` (with PKCE). The server stores the request (5 min, in memory) and redirects to Google with its own `state` and nonce.
-4. Google returns to `/oauth/google/callback`. The server verifies the ID token, the nonce and the allowlist.
+3. The client opens the browser at `/authorize` (with PKCE). The server stores the request (5 min, in memory) and redirects to Google with its own `state` and nonce. At most 20 requests per client and 1,000 in all are kept; past either cap the oldest is dropped, so a flood of `/authorize` calls can't refuse the owner's.
+4. Google returns to `/oauth/google/callback`. The server verifies the ID token, the nonce and the allowlist. A nonce mismatch sends `error=access_denied` to the client's `redirect_uri`.
 5. **Consent page**: "Allow **<client name>** to read your Search Console data? Codes will be sent to **<redirect host>**. Access ends on **<date>**." Approve / Deny.
    - Needed even after Google sign-in: anyone can register a client with their own `redirect_uri` and send the owner an `/authorize` link; if the owner is already signed in to Google, Google may not prompt, and the code would go to the attacker. The page shows which client asks and where the code goes, and needs a click.
    - The Approve form carries a single-use CSRF token bound to the pending request.
-6. On Approve, the server redirects to the client's `redirect_uri` with a single-use code (5 min, in memory). The client exchanges it at `/token`, and only then is the grant created, so an approval whose code is never exchanged leaves nothing behind.
+6. On Approve, the server redirects to the client's `redirect_uri` with a single-use code (5 min, in memory). The client exchanges it at `/token` with the same `redirect_uri` (which may be left out only when the client registered just that one URI), and only then is the grant created, so an approval whose code is never exchanged leaves nothing behind.
 
 Deny or a disallowed email: redirect to the client's `redirect_uri` with `error=access_denied`; log a warning with the email.
 
@@ -55,7 +55,7 @@ Deny or a disallowed email: redirect to the client's `redirect_uri` with `error=
 
 **Access token**: 32 random bytes, valid 1 hour, never past the grant's expiry.
 
-**Refresh token**: 32 random bytes, single-use. Each refresh returns a new access token and a new refresh token and invalidates the old pair. A refresh token that was already used revokes the whole grant and logs an error. A network retry of a refresh can trip this too; recovery is one new sign-in. A refresh on an expired grant returns `invalid_grant`.
+**Refresh token**: 32 random bytes, single-use. Each refresh returns a new access token and a new refresh token and invalidates the old pair. A refresh token that was already used revokes the whole grant and logs an error, with one exception: the refresh token exchanged last, presented again by the same client within 60 seconds of that exchange, gets a new pair (the pair issued by the first exchange stops working) and logs a warning. This covers a lost response and two copies of a client refreshing at once; repeats don't extend the 60 seconds. New tokens are written to disk before the client receives them. A refresh on an expired grant returns `invalid_grant`.
 
 **Revocation**: `/revoke` (from clients) and the `/clients` page both delete the grant's tokens at once; the next request gets 401.
 
@@ -69,7 +69,7 @@ Deny or a disallowed email: redirect to the client's `redirect_uri` with `error=
 - written on every change to clients, grants or tokens, without waiting for the write: if the process crashes in the instant between issuing a new pair and saving, the previous refresh token works once more after the restart (accepted);
 - entries that fail validation on load are dropped with a warning; client secrets are never stored, because every registered client is made public (`token_endpoint_auth_method: none`, PKCE required), and only the client fields the server uses are kept; `lastUsedAt` is updated in memory and flushed at most once a minute and at shutdown;
 - registration clean-up: a client with no grant is deleted 24 hours after registering; at most 100 registered clients: when full, the oldest client without a grant is forgotten (registration grants nothing, so this is safe), and a registration is refused only when every client has a grant;
-- expired grants are deleted on startup and once a day;
+- expired grants are deleted on startup and once a day (the store runs this itself), and are hidden from the Connected clients page as soon as they expire;
 - a file that can't be read or parsed on startup is renamed to `oauth-state.json.corrupt-<timestamp>`, an error is logged, and the server starts with no grants (every client signs in again).
 
 Authorization requests, codes, Google `state`/nonce and `/clients` sessions are in memory only; a restart during a sign-in means retrying it.
@@ -115,7 +115,7 @@ Other changes:
 | Disallowed email, or the owner cancels at Google or denies consent | `error=access_denied` to the client's `redirect_uri`; warning logged |
 | Expired or revoked access token | 401, `WWW-Authenticate: Bearer error="invalid_token", resource_metadata="…"` |
 | Grant expired | refresh returns `invalid_grant`; the client starts a new sign-in |
-| Refresh token reused | grant revoked, `invalid_grant`, error logged |
+| Refresh token reused | grant revoked, `invalid_grant`, error logged (a repeat of the last refresh within 60 s gets a new pair instead) |
 | Pending sign-in lost (timeout or restart) | error page asking to start the connection again |
 | Google's code exchange fails (Google down, or a made-up code) | client sign-in: `error=temporarily_unavailable` to the client's `redirect_uri`; clients page: a 502 page |
 | Too many callbacks from one address | 429 page |
@@ -125,7 +125,7 @@ Other changes:
 
 Google is replaced by an injected fake ID-token verifier.
 
-- **Store**: expiry dates (00:00 UTC boundary, TTL), access tokens capped at grant expiry, refresh rotation, reuse revoking the grant, client pruning and cap, expired-grant clean-up, corrupt-file handling, and that only hashes reach the file.
+- **Store**: expiry dates (00:00 UTC boundary, TTL), access tokens capped at grant expiry, refresh rotation, reuse revoking the grant, the 60-second grace period, client pruning and cap, expired-grant clean-up, corrupt-file handling, and that only hashes reach the file.
 - **HTTP end to end**: register → authorize → Google callback → consent → `/token` → MCP tool call → refresh → reuse → 401. Rejections: missing or wrong CSRF token, disallowed email, unverified email, mismatched `redirect_uri`, wrong PKCE verifier. Fixed tokens still accepted alongside OAuth.
 - **`/clients`**: sign-in redirect, listing, revoke, revoke all, CSRF rejection, session expiry.
 - **Config**: all-or-nothing rule for the four variables, fixed tokens optional with OAuth on, `MCP_PUBLIC_URL` validation.

@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { sha256Hex } from './secrets.js';
 import { z } from 'zod';
 
 const csv = z
@@ -46,7 +46,7 @@ export interface AuthToken {
 const isRealDate = (d: string) => !Number.isNaN(Date.parse(`${d}T00:00:00Z`)) && new Date(`${d}T00:00:00Z`).toISOString().startsWith(d);
 
 /** A short, non-reversible label for an unnamed token, safe to log. */
-export const tokenFingerprint = (token: string) => `sha256:${createHash('sha256').update(token).digest('hex').slice(0, 8)}`;
+export const tokenFingerprint = (token: string) => `sha256:${sha256Hex(token).slice(0, 8)}`;
 
 /**
  * Combines MCP_AUTH_TOKEN and MCP_AUTH_TOKENS ("name:token" or bare tokens,

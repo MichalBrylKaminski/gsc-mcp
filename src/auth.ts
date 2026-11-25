@@ -1,6 +1,7 @@
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import { randomBytes, timingSafeEqual } from 'node:crypto';
 import type { AuthToken } from './config.js';
 import type { Logger } from './logger.js';
+import { sha256 } from './secrets.js';
 
 export const DAY_MS = 86_400_000;
 /** Warn in the logs and in tool responses when a token has this many days or fewer left. */
@@ -30,7 +31,6 @@ interface Entry {
   expiresAtMs?: number;
 }
 
-const sha256 = (s: string) => createHash('sha256').update(s).digest();
 export const utcDay = (ms: number) => new Date(ms).toISOString().slice(0, 10);
 
 /** When a token dated `expiresOn` (YYYY-MM-DD) stops working: 00:00 UTC that day. */

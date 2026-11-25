@@ -509,7 +509,7 @@ Optional, and it works alongside the fixed tokens: the server accepts a fixed to
 2. It registers itself at `/register` (this alone grants nothing) and opens your browser at `/authorize`.
 3. You sign in with Google. Only verified accounts listed in `MCP_OAUTH_ALLOWED_EMAILS` get further.
 4. A consent page shows which client is asking, where the code will be sent and when access ends. Click **Approve**. This step matters even after the Google sign-in: anyone can register a client and send you a sign-in link, and if you're already signed in to Google, Google may not ask you anything.
-5. The client gets an access token (valid for one hour) and a refresh token. Each refresh replaces both, and a refresh token that is used twice is treated as stolen: the whole sign-in is revoked.
+5. The client gets an access token (valid for one hour) and a refresh token. Each refresh replaces both, and a refresh token that is used twice is treated as stolen: the whole sign-in is revoked. The one exception is the client's own retry: the refresh token exchanged last may be sent again within 60 seconds and gets a new pair.
 
 **How long it lasts.** A sign-in ends at 00:00 UTC on the date shown on the consent page: the day you approved it plus `MCP_AUTH_TOKEN_TTL_DAYS` (default 90). Refreshing never extends it. In the last 14 days, tool results carry a `tokenNotice` asking you to reconnect; then the client asks you to sign in again. `MCP_AUTH_AUTO_EXPIRE` applies only to fixed tokens.
 

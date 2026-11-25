@@ -1,9 +1,12 @@
-import { InvalidGrantError, InvalidTokenError, TooManyRequestsError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
+import { InvalidGrantError, InvalidTokenError } from '@modelcontextprotocol/sdk/server/auth/errors.js';
 import type { AuthorizationParams } from '@modelcontextprotocol/sdk/server/auth/provider.js';
 import type { OAuthClientInformationFull } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { Response } from 'express';
+import { mkdtempSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import type { Logger } from '../src/logger.js';
+import { silentLogger, type Logger } from '../src/logger.js';
 import { GscOAuthProvider, redirectTarget } from '../src/oauth/provider.js';
 import { OAuthStore } from '../src/oauth/store.js';
 import { fakeGoogle } from './helpers.js';
@@ -146,7 +149,12 @@ describe('GscOAuthProvider', () => {
   it('rejects a wrong nonce or a failed Google exchange', async () => {
     const p = setup();
     p.g.setNext({ nonce: 'other' });
-    expect((await toConsent(p)).ret).toMatchObject({ kind: 'error', status: 400 });
+    const bad = new URL(((await toConsent(p)).ret as { url: string }).url);
+    expect(bad.origin + bad.pathname).toBe('https://grok.example/cb');
+    expect(bad.searchParams.get('error')).toBe('access_denied');
+    expect(bad.searchParams.get('state')).toBe('client-state');
+    expect(bad.searchParams.has('code')).toBe(false);
+    expect(p.calls).toContainEqual(expect.objectContaining({ level: 'warn', msg: 'Google sign-in failed', fields: { error: 'nonce mismatch' } }));
     p.g.setNext(new Error('invalid_grant'));
     const { ret } = await toConsent(p);
     expect(ret.kind).toBe('redirect');
@@ -192,7 +200,9 @@ describe('GscOAuthProvider', () => {
   it('rejects an ID token without a nonce', async () => {
     const p = setup();
     p.g.setNext({ nonce: undefined });
-    expect((await toConsent(p)).ret).toMatchObject({ kind: 'error', status: 400 });
+    const { ret } = await toConsent(p);
+    expect(ret.kind).toBe('redirect');
+    expect(new URL((ret as { url: string }).url).searchParams.get('error')).toBe('access_denied');
   });
 
   it('logs a cancel at Google', async () => {
@@ -203,13 +213,73 @@ describe('GscOAuthProvider', () => {
     expect(p.calls).toContainEqual(expect.objectContaining({ level: 'warn', msg: 'sign-in cancelled', fields: { reason: 'access_denied' } }));
   });
 
-  it('caps sign-ins in progress', async () => {
+  it('keeps at most 20 sign-ins per client, dropping the oldest', async () => {
     const p = setup();
     const { res } = fakeRes();
-    for (let i = 0; i < 1000; i++) await p.provider.authorize(CLIENT, PARAMS, res);
-    await expect(p.provider.authorize(CLIENT, PARAMS, res)).rejects.toThrow(TooManyRequestsError);
-    vi.setSystemTime(new Date(Date.now() + 300_001));
-    await expect(p.provider.authorize(CLIENT, PARAMS, res)).resolves.toBeUndefined();
+    await p.provider.authorize(CLIENT, PARAMS, res);
+    const first = p.g.lastState();
+    await p.provider.authorize(CLIENT, PARAMS, res);
+    const second = p.g.lastState();
+    for (let i = 0; i < 19; i++) await p.provider.authorize(CLIENT, PARAMS, res);
+    expect(await p.provider.handleGoogleReturn({ state: first, code: 'google-code' })).toMatchObject({ kind: 'error', status: 400 });
+    expect((await p.provider.handleGoogleReturn({ state: second, code: second })).kind).toBe('consent');
+  });
+
+  it("a flood from other clients can't block the owner's sign-in", async () => {
+    const p = setup();
+    const { res } = fakeRes();
+    for (let i = 0; i < 60; i++) {
+      const spam = { ...CLIENT, client_id: `spam-${i}` };
+      for (let j = 0; j < 20; j++) await p.provider.authorize(spam, PARAMS, res);
+    }
+    await p.provider.authorize(CLIENT, PARAMS, res);
+    const owner = p.g.lastState();
+    for (let i = 0; i < 900; i++) await p.provider.authorize({ ...CLIENT, client_id: `late-${i % 50}` }, PARAMS, res);
+    expect((await p.provider.handleGoogleReturn({ state: owner, code: owner })).kind).toBe('consent');
+  });
+
+  it('caps sign-ins in progress at 1000, dropping the oldest', async () => {
+    const p = setup();
+    const { res } = fakeRes();
+    await p.provider.authorize(CLIENT, PARAMS, res);
+    const first = p.g.lastState();
+    for (let i = 0; i < 1000; i++) await p.provider.authorize({ ...CLIENT, client_id: `c-${i % 100}` }, PARAMS, res);
+    expect(await p.provider.handleGoogleReturn({ state: first, code: first })).toMatchObject({ kind: 'error', status: 400 });
+  });
+
+  it('requires redirect_uri at /token unless the code went to the only registered URI', async () => {
+    const MULTI: OAuthClientInformationFull = { ...CLIENT, client_id: 'multi', redirect_uris: ['https://grok.example/cb', 'https://grok.example/cb2'] };
+    const p = setup();
+    p.store.registerClient(MULTI);
+    const codeFor = async (client: OAuthClientInformationFull) => {
+      const { res } = fakeRes();
+      await p.provider.authorize(client, PARAMS, res);
+      const state = p.g.lastState();
+      const ret = await p.provider.handleGoogleReturn({ state, code: state });
+      if (ret.kind !== 'consent') throw new Error('expected consent');
+      return new URL((p.provider.decideConsent(ret.consentId, ret.csrf, true) as { url: string }).url).searchParams.get('code')!;
+    };
+    await expect(p.provider.exchangeAuthorizationCode(MULTI, await codeFor(MULTI))).rejects.toThrow(InvalidGrantError);
+    await expect(p.provider.exchangeAuthorizationCode(MULTI, await codeFor(MULTI), undefined, 'https://grok.example/cb2')).rejects.toThrow(InvalidGrantError);
+    await expect(p.provider.exchangeAuthorizationCode(MULTI, await codeFor(MULTI), undefined, 'https://grok.example/cb')).resolves.toMatchObject({ token_type: 'bearer' });
+    await expect(p.provider.exchangeAuthorizationCode(CLIENT, await codeFor(CLIENT))).resolves.toMatchObject({ token_type: 'bearer' });
+  });
+
+  it('saves new tokens to disk before handing them out', async () => {
+    const file = join(mkdtempSync(join(tmpdir(), 'gsc-mcp-provider-')), 'oauth-state.json');
+    const g = fakeGoogle();
+    const store = new OAuthStore({ file, ttlDays: 90, logger: silentLogger });
+    store.registerClient(CLIENT);
+    const provider = new GscOAuthProvider({ store, google: g.google, allowedEmails: ['owner@example.com'], ttlDays: 90, logger: silentLogger });
+    const { res } = fakeRes();
+    await provider.authorize(CLIENT, PARAMS, res);
+    const ret = await provider.handleGoogleReturn({ state: g.lastState(), code: g.lastState() });
+    if (ret.kind !== 'consent') throw new Error('expected consent');
+    const code = new URL((provider.decideConsent(ret.consentId, ret.csrf, true) as { url: string }).url).searchParams.get('code')!;
+    const t1 = await provider.exchangeAuthorizationCode(CLIENT, code);
+    expect(new OAuthStore({ file, ttlDays: 90, logger: silentLogger }).verifyAccess(t1.access_token)).toBeDefined();
+    const t2 = await provider.exchangeRefreshToken(CLIENT, t1.refresh_token!);
+    expect(new OAuthStore({ file, ttlDays: 90, logger: silentLogger }).refresh(CLIENT.client_id, t2.refresh_token!).access_token).toBeTruthy();
   });
 
   it('creates the grant only when the code is exchanged', async () => {

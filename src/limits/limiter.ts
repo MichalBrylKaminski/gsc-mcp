@@ -78,16 +78,42 @@ export class JsonFile<T> {
     readonly file: string | undefined,
     private readonly label: string,
     private readonly logger?: Logger,
+    /** Rename a file that isn't valid JSON (or fails `read`'s check) to `<file>.corrupt-<ms>` instead of overwriting it later. */
+    private readonly opts: { setAsideCorrupt?: boolean } = {},
   ) {}
 
-  read(): T | undefined {
-    if (!this.file) return undefined;
+  /** The saved data, or undefined when there is none or it is unreadable, not JSON, or fails `valid`. */
+  read(valid: (data: unknown) => boolean = () => true): T | undefined {
+    const file = this.file;
+    if (!file) return undefined;
+    let text: string;
     try {
-      return JSON.parse(readFileSync(this.file, 'utf8')) as T;
+      text = readFileSync(file, 'utf8');
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') this.logger?.warn(`${this.label} unreadable, starting fresh`, { file: this.file });
+      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') this.logger?.warn(`${this.label} unreadable, starting fresh`, { file, error: (err as Error).message });
       return undefined;
     }
+    let data: unknown;
+    let ok = false;
+    try {
+      data = JSON.parse(text);
+      ok = valid(data);
+    } catch {
+      // not JSON
+    }
+    if (ok) return data as T;
+    if (!this.opts.setAsideCorrupt) {
+      this.logger?.warn(`${this.label} unreadable, starting fresh`, { file });
+      return undefined;
+    }
+    const aside = `${file}.corrupt-${Date.now()}`;
+    try {
+      renameSync(file, aside);
+    } catch {
+      // If it can't be moved, the next save overwrites it.
+    }
+    this.logger?.error(`${this.label} is corrupt; set aside, starting fresh`, { file, movedTo: aside });
+    return undefined;
   }
 
   /** Schedules a save of `data()`, evaluated when the write happens. */

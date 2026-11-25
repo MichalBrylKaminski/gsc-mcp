@@ -168,11 +168,24 @@ describe('OAuth flow', () => {
     const t2 = (await refreshed.json()) as { access_token: string; refresh_token: string };
     expect(t2.refresh_token).not.toBe(t1.refresh_token);
 
-    const reused = await fetch(`${app.base}/token`, form({ grant_type: 'refresh_token', refresh_token: t1.refresh_token, client_id: c.clientId }));
-    expect(reused.status).toBe(400);
-    expect(await reused.json()).toMatchObject({ error: 'invalid_grant' });
-    const after = await fetch(`${app.base}/gsc-mcp`, { method: 'POST', headers: { authorization: `Bearer ${t2.access_token}`, 'content-type': 'application/json' }, body: '{}' });
-    expect(after.status).toBe(401);
+    // Presented again at once (a lost response): a new pair, and the one it replaces stops working.
+    const repeated = await fetch(`${app.base}/token`, form({ grant_type: 'refresh_token', refresh_token: t1.refresh_token, client_id: c.clientId }));
+    expect(repeated.status).toBe(200);
+    const t3 = (await repeated.json()) as { access_token: string; refresh_token: string };
+    const mcpPost = (token: string) => fetch(`${app.base}/gsc-mcp`, { method: 'POST', headers: { authorization: `Bearer ${token}`, 'content-type': 'application/json' }, body: '{}' });
+    expect((await mcpPost(t2.access_token)).status).toBe(401);
+
+    // Presented again after the grace period: copied, so the grant is revoked.
+    vi.useFakeTimers({ toFake: ['Date'] });
+    vi.setSystemTime(new Date(Date.now() + 61_000));
+    try {
+      const reused = await fetch(`${app.base}/token`, form({ grant_type: 'refresh_token', refresh_token: t1.refresh_token, client_id: c.clientId }));
+      expect(reused.status).toBe(400);
+      expect(await reused.json()).toMatchObject({ error: 'invalid_grant' });
+      expect((await mcpPost(t3.access_token)).status).toBe(401);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('escapes the client name', async () => {

@@ -1,4 +1,4 @@
-import { createHash } from 'node:crypto';
+import { sha256Hex } from './secrets.js';
 import { LRUCache } from 'lru-cache';
 
 /** Cache lifetimes. Google asks clients not to re-query the same data. */
@@ -24,7 +24,7 @@ function stable(value: unknown): unknown {
 }
 
 export function cacheKey(method: string, params: unknown): string {
-  return `${method}:${createHash('sha256').update(JSON.stringify(stable(params))).digest('hex')}`;
+  return `${method}:${sha256Hex(JSON.stringify(stable(params)))}`;
 }
 
 /** LRU+TTL cache that also shares one in-flight load between identical callers. */
