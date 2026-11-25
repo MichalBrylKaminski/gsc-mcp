@@ -128,7 +128,7 @@ export function clientsRoutes(o: ClientsRoutesOptions): express.Router {
   });
 
   const form = express.urlencoded({ extended: false, limit: '4kb' });
-  /** Runs `act` only for a live session with the right csrf; otherwise 403. Then back to the list. */
+  /** Runs `act` only for a live session with the right csrf; otherwise 403. Then back to the list, unless `act` answered. */
   const post = (path: string, act: (body: Record<string, unknown>, session: Session, id: string, res: Response) => void) =>
     router.post(path, form, (req, res) => {
       const { id, session } = sessionOf(req);
@@ -138,7 +138,7 @@ export function clientsRoutes(o: ClientsRoutesOptions): express.Router {
         return sendPage(res, 403, errorPage('Your session has ended or this form is out of date. Open the Connected clients page again.'));
       }
       act(body, session, id, res);
-      res.set('Cache-Control', 'no-store').redirect(303, '/clients');
+      if (!res.headersSent) res.set('Cache-Control', 'no-store').redirect(303, '/clients');
     });
 
   post('/clients/revoke', (body, session) => {
@@ -151,7 +151,9 @@ export function clientsRoutes(o: ClientsRoutesOptions): express.Router {
   });
   post('/clients/sign-out', (_body, _session, id, res) => {
     o.sessions.delete(id);
+    // A page, not a redirect: /clients would start a new Google sign-in straight away.
     res.set('Set-Cookie', clearedCookie);
+    sendPage(res, 200, page('Signed out', '<div class="card"><h1>Signed out</h1><p>You are signed out of the Connected clients page.</p><p><a href="/clients">Sign in again</a></p></div>'));
   });
 
   return router;

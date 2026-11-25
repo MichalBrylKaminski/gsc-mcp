@@ -150,7 +150,7 @@ describe('OAuth settings', () => {
   });
 
   it('keeps MCP_PATH off the OAuth paths when OAuth is on', () => {
-    for (const bad of ['/token', '/register', '/clients', '/oauth', '/oauth/x', '/.well-known']) {
+    for (const bad of ['/token', '/register', '/clients', '/oauth', '/oauth/x', '/.well-known', '/Token', '/CLIENTS/x']) {
       expect(() => loadConfig({ ...base, ...oauthEnv, MCP_PATH: bad }), bad).toThrow(/^\s+MCP_PATH: cannot be/m);
       expect(loadConfig({ ...base, MCP_PATH: bad }).MCP_PATH).toBe(bad); // fine without OAuth
     }

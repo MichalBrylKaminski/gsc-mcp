@@ -136,7 +136,8 @@ describe('Connected clients page', () => {
   it('signs out', async () => {
     const { cookie, csrf } = await signIn();
     const out = await fetch(`${app.base}/clients/sign-out`, { ...form({ csrf }), headers: { 'content-type': 'application/x-www-form-urlencoded', cookie } });
-    expect(out.status).toBe(303);
+    expect(out.status).toBe(200); // a page, not a redirect into a new sign-in
+    expect(await out.text()).toContain('Signed out');
     expect(out.headers.get('set-cookie')).toMatch(/^__Host-gsc_mcp_session=; Path=\/; Max-Age=0/);
     expect((await fetch(`${app.base}/clients`, { headers: { cookie }, redirect: 'manual' })).status).toBe(302);
   });

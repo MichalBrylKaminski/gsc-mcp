@@ -2,7 +2,8 @@ import { hostHeaderValidation } from '@modelcontextprotocol/sdk/server/middlewar
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
 import express, { type Express, type NextFunction, type Request, type RequestHandler, type Response } from 'express';
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
-import type { ClientInfo, TokenRegistry } from './auth.js';
+import { authInfoFor, type ClientInfo, type TokenRegistry } from './auth.js';
+import { OAUTH_PATHS } from './config.js';
 import type { Logger } from './logger.js';
 import type { OAuthStore } from './oauth/store.js';
 import { buildServer } from './server.js';
@@ -57,13 +58,7 @@ export function bearerAuth(tokens: TokenRegistry, logger: Logger, oauth?: Pick<H
     const client: ClientInfo | undefined = result?.kind === 'ok' ? result.client : result?.kind === 'unknown' ? oauth?.store.verifyAccess(given!) : undefined;
     if (client) {
       res.locals.client = client.name;
-      req.auth = {
-        token: '', // tools never need the token itself
-        clientId: client.name,
-        scopes: [],
-        ...(client.expiresAt ? { expiresAt: Math.floor(Date.parse(client.expiresAt) / 1000) } : {}),
-        extra: { client },
-      };
+      req.auth = authInfoFor(client);
       return next();
     }
     // Never log what was sent; a typo'd token is still mostly a secret.
@@ -98,7 +93,10 @@ export function createApp({ tokens, oauth, trustProxy, allowedHosts, mcpPath = '
   });
 
   // The OAuth endpoints and pages answer only for the allowed hosts too (DNS-rebinding protection).
-  if (oauth?.router) app.use(...(allowedHosts?.length ? [hostHeaderValidation(allowedHosts)] : []), oauth.router);
+  if (oauth?.router) {
+    if (allowedHosts?.length) app.use(OAUTH_PATHS, hostHeaderValidation(allowedHosts));
+    app.use(oauth.router);
+  }
 
   const mcp = express.Router();
   if (allowedHosts?.length) mcp.use(hostHeaderValidation(allowedHosts));

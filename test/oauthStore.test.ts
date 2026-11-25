@@ -87,13 +87,43 @@ describe('OAuthStore grants', () => {
     const t3 = store.refresh(client.client_id, t1.refresh_token);
     expect(store.grants()).toHaveLength(1);
     expect(store.verifyAccess(t2.access_token)).toBeUndefined();
-    expect(() => store.refresh(client.client_id, t2.refresh_token)).toThrow(InvalidGrantError); // replaced, not spent: no revoke
     expect(store.verifyAccess(t3.access_token)).toBeDefined();
     expect(calls).toContainEqual(expect.objectContaining({ level: 'warn', msg: 'refresh token presented again within the grace period; issued a new pair' }));
-    // The grace period runs from the real refresh; repeats don't extend it.
-    vi.setSystemTime(new Date(Date.parse(NOW) + 60_000));
+    expect(store.refresh(client.client_id, t3.refresh_token).access_token).toBeTruthy();
+  });
+
+  it('allows one grace repeat only', () => {
+    const { store, client, grant } = setup();
+    const t1 = store.issueTokens(grant.id);
+    store.refresh(client.client_id, t1.refresh_token);
+    store.refresh(client.client_id, t1.refresh_token);
     expect(() => store.refresh(client.client_id, t1.refresh_token)).toThrow(InvalidGrantError);
     expect(store.grants()).toEqual([]);
+  });
+
+  it('a thief who takes the grace pair is caught when the real client refreshes', () => {
+    const { logger, calls } = spyLogger();
+    const { store, client, grant } = setup({ logger });
+    const t1 = store.issueTokens(grant.id); // copied by a thief
+    const real = store.refresh(client.client_id, t1.refresh_token);
+    const stolen = store.refresh(client.client_id, t1.refresh_token); // thief, within 60 s
+    vi.setSystemTime(new Date(Date.parse(NOW) + 30_000));
+    expect(() => store.refresh(client.client_id, real.refresh_token)).toThrow(InvalidGrantError);
+    expect(store.grants()).toEqual([]);
+    expect(store.verifyAccess(stolen.access_token)).toBeUndefined();
+    expect(calls).toContainEqual(expect.objectContaining({ level: 'error', msg: 'refresh token reused' }));
+  });
+
+  it('a repeat after the grant ended is not reported as theft', () => {
+    const { logger, calls } = spyLogger();
+    vi.setSystemTime(new Date('2027-02-21T23:59:50Z'));
+    const { store, client } = setup({ logger });
+    const grant = store.createGrant({ clientId: client.client_id, clientName: 'Grok', email: 'o@x.dev', redirectHost: 'x', expiresOn: '2027-02-22' });
+    const t1 = store.issueTokens(grant.id);
+    store.refresh(client.client_id, t1.refresh_token);
+    vi.setSystemTime(new Date('2027-02-22T00:00:05Z'));
+    expect(() => store.refresh(client.client_id, t1.refresh_token)).toThrow(/sign-in has ended/);
+    expect(calls.filter((c) => c.level === 'error')).toEqual([]);
   });
 
   it('no grace for an older refresh token or another client', () => {

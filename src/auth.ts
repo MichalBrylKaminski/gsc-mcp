@@ -1,4 +1,5 @@
 import { randomBytes, timingSafeEqual } from 'node:crypto';
+import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import type { AuthToken } from './config.js';
 import type { Logger } from './logger.js';
 import { sha256 } from './secrets.js';
@@ -21,6 +22,17 @@ export interface ClientInfo {
   daysLeft?: number;
   /** Set for OAuth clients: renewing means signing in again, not asking for a new token. */
   signIn?: true;
+}
+
+/** The SDK's request auth for a client; tools read the client from `extra.client` and never need the token itself. */
+export function authInfoFor(client: ClientInfo): AuthInfo {
+  return {
+    token: '',
+    clientId: client.name,
+    scopes: [],
+    ...(client.expiresAt ? { expiresAt: Math.floor(Date.parse(client.expiresAt) / 1000) } : {}),
+    extra: { client },
+  };
 }
 
 export type CheckResult = { kind: 'ok'; client: ClientInfo } | { kind: 'expired'; name: string } | { kind: 'unknown' };

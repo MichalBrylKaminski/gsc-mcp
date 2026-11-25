@@ -380,4 +380,16 @@ describe('GscOAuthProvider', () => {
     expect(await p.provider.handleGoogleReturn({ state: p.g.lastState(), code: 'c' }, s.binding, deny)).toMatchObject({ kind: 'error', status: 429 });
     expect(asked).toBe(1);
   });
+
+  it('tells a waiting client when its sign-in is rate limited', async () => {
+    const p = setup();
+    const { res } = fakeRes();
+    await p.provider.authorize(CLIENT, PARAMS, res);
+    const ret = await p.provider.handleGoogleReturn({ state: p.g.lastState(), code: 'c' }, undefined, () => false);
+    expect(ret.kind).toBe('redirect');
+    const url = new URL((ret as { url: string }).url);
+    expect(url.origin + url.pathname).toBe('https://grok.example/cb');
+    expect(url.searchParams.get('error')).toBe('temporarily_unavailable');
+    expect(url.searchParams.get('state')).toBe('client-state');
+  });
 });

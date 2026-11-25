@@ -4,7 +4,7 @@ import type { AuthorizationParams, OAuthServerProvider } from '@modelcontextprot
 import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
 import type { OAuthClientInformationFull, OAuthTokenRevocationRequest, OAuthTokens } from '@modelcontextprotocol/sdk/shared/auth.js';
 import type { Response } from 'express';
-import { expiryDayFor } from '../auth.js';
+import { authInfoFor, expiryDayFor } from '../auth.js';
 import type { Logger } from '../logger.js';
 import type { GoogleSignIn } from './google.js';
 import { randomSecret as random, sameSecret } from '../secrets.js';
@@ -170,7 +170,7 @@ export class GscOAuthProvider implements OAuthServerProvider {
     if (nonce === undefined) return { kind: 'error', status: 400, message: STALE };
     const params = pending?.params;
     /** Ends the sign-in: a client gets an OAuth error at its redirect URI (it is waiting for one), the clients page an error page. */
-    const fail = (status: 403 | 502, page: string, error: string, description: string): GoogleReturn =>
+    const fail = (status: 403 | 429 | 502, page: string, error: string, description: string): GoogleReturn =>
       params ? { kind: 'redirect', url: redirectWith(params.redirectUri, { error, error_description: description, state: params.state }) } : { kind: 'error', status, message: page };
     const denied = (reason: string, email?: string): GoogleReturn => {
       if (email !== undefined) this.o.logger.warn('sign-in refused', { email, reason });
@@ -179,7 +179,10 @@ export class GscOAuthProvider implements OAuthServerProvider {
     };
     if (q.error || !q.code) return denied((q.error ?? 'no code from Google').slice(0, 64));
 
-    if (!admit()) return { kind: 'error', status: 429, message: 'Too many sign-in attempts from this address. Wait ten minutes and try again.' };
+    if (!admit()) {
+      this.o.logger.warn('sign-in rate limited');
+      return fail(429, 'Too many sign-in attempts from this address. Wait ten minutes and try again.', 'temporarily_unavailable', 'Too many sign-in attempts; wait ten minutes and try again.');
+    }
     let identity;
     try {
       identity = await this.o.google.verify(q.code);
@@ -257,13 +260,13 @@ export class GscOAuthProvider implements OAuthServerProvider {
     const grant = this.o.store.createGrant({ clientId: c.clientId, clientName: c.clientName, email: c.email, redirectHost: redirectTarget(c.redirectUri), expiresOn: c.expiresOn });
     this.o.logger.info('client connected', { client: grantLabel(grant), email: grant.email, redirectHost: grant.redirectHost, expiresAt: grant.expiresAt });
     const tokens = this.o.store.issueTokens(grant.id);
-    await this.o.store.flush(); // on disk before the client gets them, so a crash can't forget them
+    await this.o.store.flush(); // wait for the write, so a crash right after can't forget them (a failed write is logged)
     return tokens;
   }
 
   async exchangeRefreshToken(client: OAuthClientInformationFull, refreshToken: string): Promise<OAuthTokens> {
     const tokens = this.o.store.refresh(client.client_id, refreshToken);
-    await this.o.store.flush(); // the old refresh token is spent; the new one must survive a crash
+    await this.o.store.flush(); // the old refresh token is spent; wait for the new one to be written (a failed write is logged)
     return tokens;
   }
 
@@ -274,7 +277,7 @@ export class GscOAuthProvider implements OAuthServerProvider {
   async verifyAccessToken(token: string): Promise<AuthInfo> {
     const client = this.o.store.verifyAccess(token);
     if (!client) throw new InvalidTokenError('Invalid or expired access token.');
-    return { token: '', clientId: client.name, scopes: [], expiresAt: Math.floor(Date.parse(client.expiresAt!) / 1000), extra: { client } };
+    return authInfoFor(client);
   }
 
   /** RFC 7009: a client can revoke only its own tokens; anything else is ignored. */

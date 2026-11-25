@@ -55,7 +55,7 @@ Deny or a disallowed email: redirect to the client's `redirect_uri` with `error=
 
 **Access token**: 32 random bytes, valid 1 hour, never past the grant's expiry.
 
-**Refresh token**: 32 random bytes, single-use. Each refresh returns a new access token and a new refresh token and invalidates the old pair. A refresh token that was already used revokes the whole grant and logs an error, with one exception: the refresh token exchanged last, presented again by the same client within 60 seconds of that exchange, gets a new pair (the pair issued by the first exchange stops working) and logs a warning. This covers a lost response and two copies of a client refreshing at once; repeats don't extend the 60 seconds. New tokens are written to disk before the client receives them. A refresh on an expired grant returns `invalid_grant`.
+**Refresh token**: 32 random bytes, single-use. Each refresh returns a new access token and a new refresh token and invalidates the old pair. A refresh token that was already used revokes the whole grant and logs an error, with one exception: the refresh token exchanged last, presented again by the same client within 60 seconds of that exchange, gets a new pair once, and logs a warning. The refresh token from the first exchange then counts as used, so if a thief took the repeat, the real client's next refresh revokes the grant. This covers a lost response. New tokens are written to disk before the client receives them (a failed write is logged; the tokens then work until a restart). A refresh on an expired grant returns `invalid_grant`.
 
 **Revocation**: `/revoke` (from clients) and the `/clients` page both delete the grant's tokens at once; the next request gets 401.
 
@@ -82,9 +82,9 @@ The client name comes from registration and is chosen by the client: it is cut t
 
 - `GET /clients`: if there is no session, redirects through Google sign-in (same allowlist), then sets a session cookie (`__Host-gsc_mcp_session`): random id, kept in server memory, 12 hours, `HttpOnly; Secure; SameSite=Lax; Path=/`.
 - The sign-in for this page keeps nothing on the server: `GET /clients` puts its Google `state` and nonce in a 5-minute `__Host-gsc_mcp_signin` cookie (`HttpOnly; Secure; SameSite=Lax`), and the callback accepts the state only from the browser holding that cookie. Anonymous `GET /clients` requests therefore can't push out the owner's sign-in or fill the queue client sign-ins use.
-- Callbacks that would call Google (a valid pending `state`, or a matching sign-in cookie) are limited to 30 per 10 minutes per client address; junk callbacks are rejected before Google and do not count. The sign-in cookie also carries its issue time, so the 5 minutes are checked on the server.
+- Callbacks that would call Google (a valid pending `state`, or a matching sign-in cookie) are limited to 30 per 10 minutes per client address; junk callbacks are rejected before Google and do not count. Past the limit a client sign-in gets `error=temporarily_unavailable` at its `redirect_uri`; the clients page gets a 429 page. The sign-in cookie also carries its issue time, so the 5 minutes are checked on the server.
 - Lists each grant: client name, redirect host, approved on, expires on, last used. Lists fixed tokens read-only: name and expiry (or "never").
-- `POST /clients/revoke` (one grant) and `POST /clients/revoke-all`, each with the session's CSRF token. `POST /clients/sign-out` ends the session.
+- `POST /clients/revoke` (one grant) and `POST /clients/revoke-all`, each with the session's CSRF token. `POST /clients/sign-out` ends the session and shows a "Signed out" page (redirecting to `/clients` would start a new sign-in).
 
 ## Configuration
 

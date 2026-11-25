@@ -260,19 +260,28 @@ export class OAuthStore {
    * Exchanges a refresh token for a new pair. Each refresh token works once;
    * one that comes back after use was copied, so the whole grant is revoked.
    * The exception: the token exchanged last, presented again by its own client
-   * within REFRESH_REUSE_GRACE_MS, gets another new pair (the previous one
-   * stops working). The grace period is not extended by using it.
+   * within REFRESH_REUSE_GRACE_MS, gets another new pair, once. The refresh
+   * token it replaces is then counted as used, so if a thief took the grace
+   * pair, the real client's next refresh revokes the grant.
    * Callers handing the tokens out should await flush() first, so a crash
-   * can't forget the new refresh token.
+   * right after can't forget the new refresh token.
    */
   refresh(clientId: string, refreshToken: string): IssuedTokens {
     const hash = sha256(refreshToken);
     const now = Date.now();
     const reused = this.byUsedRefresh.get(hash);
     if (reused) {
+      if (now >= reused.expiresAt) {
+        this.removeGrant(reused);
+        throw new InvalidGrantError('The sign-in has ended; sign in again.');
+      }
       const repeat = reused.clientId === clientId && reused.usedRefreshHashes.at(-1) === hash && reused.refreshedAt !== undefined && now - reused.refreshedAt < REFRESH_REUSE_GRACE_MS;
-      if (repeat && now < reused.expiresAt) {
+      if (repeat) {
         this.opts.logger.warn('refresh token presented again within the grace period; issued a new pair', { client: grantLabel(reused) });
+        // The refresh token being replaced counts as used: if it turns up later, someone holds a copy.
+        // And one repeat ends the grace period, so two holders can't keep trading pairs.
+        if (reused.refreshHash) this.markUsed(reused, reused.refreshHash);
+        delete reused.refreshedAt;
         return this.rotate(reused);
       }
       this.opts.logger.error('refresh token reused', { client: grantLabel(reused), note: 'the grant was revoked; the client must sign in again' });
@@ -286,11 +295,15 @@ export class OAuthStore {
       throw new InvalidGrantError('The sign-in has ended; sign in again.');
     }
     g.refreshedAt = now;
+    this.markUsed(g, hash);
+    return this.rotate(g);
+  }
+
+  private markUsed(g: StoredGrant, hash: string): void {
     g.usedRefreshHashes.push(hash);
     this.byUsedRefresh.set(hash, g);
     // Keep the most recent ones; an older copied token is still useless, just not detected as reuse.
     while (g.usedRefreshHashes.length > MAX_USED_REFRESH_HASHES) this.byUsedRefresh.delete(g.usedRefreshHashes.shift()!);
-    return this.rotate(g);
   }
 
   /** The client behind a valid access token, or undefined. Records the use. */

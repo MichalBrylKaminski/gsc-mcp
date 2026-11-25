@@ -126,7 +126,7 @@ export interface OAuthConfig {
 }
 
 /** Paths the OAuth endpoints and pages use at the root of the domain. */
-const OAUTH_PATHS = ['/.well-known', '/register', '/authorize', '/token', '/revoke', '/oauth', '/clients'];
+export const OAUTH_PATHS = ['/.well-known', '/register', '/authorize', '/token', '/revoke', '/oauth', '/clients'];
 
 const OAUTH_VARIABLES = ['MCP_PUBLIC_URL', 'GOOGLE_OAUTH_CLIENT_ID', 'GOOGLE_OAUTH_CLIENT_SECRET', 'MCP_OAUTH_ALLOWED_EMAILS'] as const;
 
@@ -210,7 +210,9 @@ const ConfigSchema = z.object({
       message: `with auto-expire on, every token needs an expiry date (name:token:YYYY-MM-DD); missing for ${undated.join(', ')}. Create dated tokens with \`node dist/issueToken.js <name>\``,
     });
   }
-  const taken = OAUTH_PATHS.find((p) => c.MCP_PATH === p || c.MCP_PATH.startsWith(`${p}/`));
+  // Express matches paths case-insensitively.
+  const mcpPath = c.MCP_PATH.toLowerCase();
+  const taken = OAUTH_PATHS.find((p) => mcpPath === p || mcpPath.startsWith(`${p}/`));
   if (oauth && taken) {
     ctx.addIssue({ code: 'custom', path: ['MCP_PATH'], message: `cannot be ${c.MCP_PATH} with OAuth sign-in on, because ${taken} is an OAuth path` });
   }
