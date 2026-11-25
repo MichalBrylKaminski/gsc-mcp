@@ -1,6 +1,6 @@
 /**
  * Creates a bearer token dated MCP_AUTH_TOKEN_TTL_DAYS (default 90) from today:
- *   node dist/issueToken.js grok          (or: npm run token -- grok)
+ *   node dist/issueToken.js grok          (or: npm run -s token -- grok)
  * Prints the MCP_AUTH_TOKENS entry, "name:token:YYYY-MM-DD", on stdout.
  */
 import { issueToken } from './auth.js';

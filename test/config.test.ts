@@ -168,3 +168,34 @@ describe('OAuth settings', () => {
     expect(() => loadConfig({ ...base, TRUST_PROXY: '11' })).toThrow(/TRUST_PROXY/);
   });
 });
+
+describe('auth token entry edge cases', () => {
+  const t = 'a'.repeat(32);
+  const T = 'b'.repeat(64);
+
+  it('takes the date off a bare token before looking for a name', () => {
+    const { authTokens } = loadConfig({ ...base, MCP_AUTH_TOKEN: undefined, MCP_AUTH_TOKENS: `${t}:2027-01-01` });
+    expect(authTokens).toEqual([{ label: tokenFingerprint(t), token: t, expiresOn: '2027-01-01' }]);
+  });
+
+  it('allows spaces around the colons', () => {
+    const { authTokens } = loadConfig({ ...base, MCP_AUTH_TOKEN: undefined, MCP_AUTH_TOKENS: `grok : ${T} : 2027-01-01` });
+    expect(authTokens).toEqual([{ label: 'grok', token: T, expiresOn: '2027-01-01' }]);
+  });
+
+  it('rejects tokens with characters a bearer token cannot have', () => {
+    for (const bad of [`grok:${T}x y`, `${T}:x:y`, `${T}"`]) {
+      expect(() => loadConfig({ ...base, MCP_AUTH_TOKEN: undefined, MCP_AUTH_TOKENS: bad }), bad).toThrow(/may contain only letters, digits/);
+    }
+    expect(() => loadConfig({ ...base, MCP_AUTH_TOKEN: `${T} x` })).toThrow(/may contain only letters, digits/);
+  });
+
+  it('rejects an empty name', () => {
+    expect(() => loadConfig({ ...base, MCP_AUTH_TOKEN: undefined, MCP_AUTH_TOKENS: `:${T}` })).toThrow(/starts with ":"/);
+  });
+
+  it('accepts base64 tokens with padding', () => {
+    const b64 = `${'Ab9+/'.repeat(8)}==`;
+    expect(loadConfig({ ...base, MCP_AUTH_TOKEN: b64 }).authTokens[0]!.token).toBe(b64);
+  });
+});

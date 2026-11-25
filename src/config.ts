@@ -32,6 +32,8 @@ export function hostnameOnly(host: string): string | undefined {
 
 export const MIN_TOKEN_LENGTH = 32;
 export const TOKEN_NAME = /^[A-Za-z0-9_.-]{1,32}$/;
+/** RFC 6750 b64token: what a bearer token may contain. It has no ":" or spaces, so ":" in an entry is always a separator. */
+const TOKEN_CHARS = /^[A-Za-z0-9\-._~+/]+=*$/;
 
 /** A bearer token clients may send, and the label logs show for it. */
 export interface AuthToken {
@@ -60,16 +62,17 @@ export function parseAuthTokens(
 ): { tokens: AuthToken[]; errors: { variable: string; message: string }[] } {
   const errors: { variable: string; message: string }[] = [];
   const tokens: AuthToken[] = [];
-  const add = (label: string | undefined, raw: string, source: string) => {
-    const dated = /^(.*):(\d{4}-\d{2}-\d{2})$/.exec(raw);
-    const token = dated ? dated[1]!.trim() : raw;
-    const expiresOn = dated?.[2];
+  const add = (label: string | undefined, token: string, expiresOn: string | undefined, source: string) => {
     if (expiresOn !== undefined && !isRealDate(expiresOn)) {
       errors.push({ variable: source, message: `"${expiresOn}" is not a real date (use YYYY-MM-DD)` });
       return;
     }
     if (token.length < MIN_TOKEN_LENGTH) {
       errors.push({ variable: source, message: `every token must be at least ${MIN_TOKEN_LENGTH} characters (try \`openssl rand -hex 32\`)` });
+      return;
+    }
+    if (!TOKEN_CHARS.test(token)) {
+      errors.push({ variable: source, message: 'a token may contain only letters, digits and - . _ ~ + / (with = at the end); check for stray spaces or colons' });
       return;
     }
     if (tokens.some((t) => t.token === token)) {
@@ -83,12 +86,22 @@ export function parseAuthTokens(
     }
     tokens.push({ label: name, token, ...(expiresOn ? { expiresOn } : {}) });
   };
-  if (single !== undefined && single !== '') add(undefined, single.trim(), 'MCP_AUTH_TOKEN');
+  // The optional date comes off the end first, so a bare token with a date is never mistaken for a name.
+  const split = (raw: string) => {
+    const dated = /^(.*?)\s*:\s*(\d{4}-\d{2}-\d{2})$/.exec(raw.trim());
+    return dated ? { rest: dated[1]!.trim(), expiresOn: dated[2] } : { rest: raw.trim(), expiresOn: undefined };
+  };
+  if (single !== undefined && single.trim() !== '') {
+    const { rest, expiresOn } = split(single);
+    add(undefined, rest, expiresOn, 'MCP_AUTH_TOKEN');
+  }
   for (const entry of list ?? []) {
-    const sep = entry.indexOf(':');
-    const name = sep > 0 ? entry.slice(0, sep) : undefined;
-    if (name !== undefined && TOKEN_NAME.test(name)) add(name, entry.slice(sep + 1).trim(), 'MCP_AUTH_TOKENS');
-    else add(undefined, entry, 'MCP_AUTH_TOKENS');
+    const { rest, expiresOn } = split(entry);
+    const m = /^([^:]*?)\s*:\s*(.*)$/.exec(rest);
+    if (m && TOKEN_NAME.test(m[1]!)) add(m[1], m[2]!, expiresOn, 'MCP_AUTH_TOKENS');
+    else if (m && m[1] === '') {
+      errors.push({ variable: 'MCP_AUTH_TOKENS', message: 'an entry starts with ":"; write name:token or just the token' });
+    } else add(undefined, rest, expiresOn, 'MCP_AUTH_TOKENS');
   }
   if (required && !tokens.length && !errors.length) errors.push({ variable: 'MCP_AUTH_TOKEN', message: 'set MCP_AUTH_TOKEN or MCP_AUTH_TOKENS (generate a token with `openssl rand -hex 32`)' });
   return { tokens, errors };

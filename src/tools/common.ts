@@ -25,14 +25,14 @@ export function ok(data: Record<string, unknown>): CallToolResult {
   return { content: [{ type: 'text', text: JSON.stringify(data) }], structuredContent: data };
 }
 
-export function fail(err: unknown, logger: Logger): CallToolResult {
+export function fail(err: unknown, logger: Logger, extra: Record<string, unknown> = {}): CallToolResult {
   let e: GscToolError;
   if (err instanceof GscToolError) e = err;
   else {
     logger.error('unexpected tool error', { error: (err as Error)?.message });
     e = new GscToolError('INTERNAL', 'Internal server error.');
   }
-  return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: { code: e.code, message: e.message, ...e.details } }) }] };
+  return { isError: true, content: [{ type: 'text', text: JSON.stringify({ error: { code: e.code, message: e.message, ...e.details }, ...extra }) }] };
 }
 
 /** What a tool body gets besides its arguments. `signal` aborts when the client goes away. */
@@ -59,12 +59,12 @@ export function handle<A>(
 ): (args: A, extra: { signal: AbortSignal; authInfo?: AuthInfo }) => Promise<CallToolResult> {
   return async (args, extra) => {
     const client = extra.authInfo?.extra?.client as ClientInfo | undefined;
+    const notice = tokenNotice(client);
     try {
       const data = await fn(args, { signal: extra.signal, client });
-      const notice = tokenNotice(client);
       return ok(notice ? { ...data, tokenNotice: notice } : data);
     } catch (err) {
-      return fail(err, logger);
+      return fail(err, logger, notice ? { tokenNotice: notice } : {});
     }
   };
 }

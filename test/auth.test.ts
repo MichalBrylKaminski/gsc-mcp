@@ -139,3 +139,19 @@ describe('expiry over HTTP', () => {
     }
   });
 });
+
+describe('tokenNotice on errors', () => {
+  it('is added to failed tool results too', async () => {
+    const { handle } = await import('../src/tools/common.js');
+    const { GscToolError } = await import('../src/errors.js');
+    const { silentLogger } = await import('../src/logger.js');
+    const tool = handle(silentLogger, async () => {
+      throw new GscToolError('DAILY_QUOTA_EXHAUSTED', 'Daily quota used up.');
+    });
+    const client = { name: 'grok', expiresAt: '2027-01-01T00:00:00.000Z', daysLeft: 5 };
+    const res = await tool({}, { signal: new AbortController().signal, authInfo: { token: '', clientId: 'grok', scopes: [], extra: { client } } });
+    expect(res.isError).toBe(true);
+    const body = JSON.parse((res.content as { text: string }[])[0]!.text);
+    expect(body).toMatchObject({ error: { code: 'DAILY_QUOTA_EXHAUSTED' }, tokenNotice: expect.stringMatching(/expires in 5 days/) });
+  });
+});

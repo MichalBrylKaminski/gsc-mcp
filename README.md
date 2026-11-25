@@ -551,7 +551,7 @@ Off by default. Set `MCP_AUTH_AUTO_EXPIRE=true` to make tokens expire, so a forg
 
   ```bash
   node dist/issueToken.js grok              # in the container: dokku run gsc-mcp node dist/issueToken.js grok
-  # grok:3f1c…9ab2:2027-02-15               (or from a checkout: npm run token -- grok)
+  # grok:3f1c…9ab2:2027-02-15               (or from a checkout: npm run -s token -- grok)
   ```
 
   Add the printed line to `MCP_AUTH_TOKENS` and give the client only the token part.
