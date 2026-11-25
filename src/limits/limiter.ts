@@ -78,11 +78,18 @@ export class JsonFile<T> {
     readonly file: string | undefined,
     private readonly label: string,
     private readonly logger?: Logger,
-    /** Rename a file that isn't valid JSON (or fails `read`'s check) to `<file>.corrupt-<ms>` instead of overwriting it later. */
+    /**
+     * Rename a file that isn't valid JSON (or fails `read`'s check) to `<file>.corrupt-<ms>` instead of
+     * overwriting it later, and throw from `read` if the file exists but can't be read at all.
+     */
     private readonly opts: { setAsideCorrupt?: boolean } = {},
   ) {}
 
-  /** The saved data, or undefined when there is none or it is unreadable, not JSON, or fails `valid`. */
+  /**
+   * The saved data, or undefined when there is none or it is unreadable, not JSON, or fails `valid`.
+   * With `setAsideCorrupt`, a file that exists but can't be read (e.g. permissions) throws instead:
+   * starting empty would overwrite it on the next save.
+   */
   read(valid: (data: unknown) => boolean = () => true): T | undefined {
     const file = this.file;
     if (!file) return undefined;
@@ -90,7 +97,9 @@ export class JsonFile<T> {
     try {
       text = readFileSync(file, 'utf8');
     } catch (err) {
-      if ((err as NodeJS.ErrnoException).code !== 'ENOENT') this.logger?.warn(`${this.label} unreadable, starting fresh`, { file, error: (err as Error).message });
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return undefined;
+      if (this.opts.setAsideCorrupt) throw new Error(`${this.label} at ${file} exists but can't be read: ${(err as Error).message}`);
+      this.logger?.warn(`${this.label} unreadable, starting fresh`, { file, error: (err as Error).message });
       return undefined;
     }
     let data: unknown;

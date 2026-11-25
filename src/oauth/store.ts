@@ -8,14 +8,18 @@ import { randomSecret, sha256Hex as sha256 } from '../secrets.js';
 
 export const ACCESS_TOKEN_TTL_MS = 3_600_000;
 /**
- * A client may present its previous refresh token again for this long after
- * exchanging it (its response was lost, or two copies of it refreshed at once)
- * and get a new pair, instead of having the grant revoked as a copied token.
+ * A client may present the refresh token it exchanged last again for this long
+ * (its response was lost, or several of its requests refreshed at once) and get
+ * another pair, instead of having the grant revoked as a copied token.
  */
 export const REFRESH_REUSE_GRACE_MS = 60_000;
+/** Live access tokens, and live refresh tokens from grace repeats, kept per grant; the oldest go first. */
+const MAX_LIVE_TOKENS = 10;
 /** A registered client that never got a grant is forgotten after this long. */
 export const UNUSED_CLIENT_TTL_MS = 86_400_000;
 export const MAX_CLIENTS = 100;
+/** A client this new may be part-way through a sign-in (three 5-minute steps), so it isn't dropped to make room. */
+export const RECENT_CLIENT_MS = 900_000;
 /** How often a changed "last used" time is saved. */
 export const LAST_USED_FLUSH_MS = 60_000;
 export const CLIENT_NAME_MAX = 64;
@@ -51,12 +55,13 @@ interface StoredGrant {
   createdAt: number;
   expiresAt: number;
   lastUsedAt?: number;
-  accessHash?: string;
-  accessExpiresAt?: number;
-  refreshHash?: string;
-  /** When a refresh token was last exchanged, for REFRESH_REUSE_GRACE_MS. */
-  refreshedAt?: number;
-  /** Refresh tokens already exchanged, oldest first; seeing one again means it was copied. */
+  /** Each access token works until its own expiry, so a refresh never cuts off a request already holding one. */
+  accessTokens: { hash: string; expiresAt: number }[];
+  /** Usually one; grace repeats add more, all retired when any of them is exchanged. */
+  refreshHashes: string[];
+  /** The refresh token exchanged last and when, for REFRESH_REUSE_GRACE_MS. */
+  lastRefresh?: { hash: string; at: number };
+  /** Refresh tokens already exchanged or retired, oldest first; seeing one again means it was copied. */
   usedRefreshHashes: string[];
 }
 
@@ -94,9 +99,11 @@ function validGrant(g: unknown): g is StoredGrant {
     isTime(x.createdAt) &&
     isTime(x.expiresAt) &&
     (x.lastUsedAt === undefined || isTime(x.lastUsedAt)) &&
-    (x.accessHash === undefined || (isStr(x.accessHash) && isTime(x.accessExpiresAt))) &&
-    (x.refreshHash === undefined || isStr(x.refreshHash)) &&
-    (x.refreshedAt === undefined || isTime(x.refreshedAt)) &&
+    Array.isArray(x.accessTokens) &&
+    x.accessTokens.every((a) => !!a && isStr(a.hash) && isTime(a.expiresAt)) &&
+    Array.isArray(x.refreshHashes) &&
+    x.refreshHashes.every(isStr) &&
+    (x.lastRefresh === undefined || (!!x.lastRefresh && isStr(x.lastRefresh.hash) && isTime(x.lastRefresh.at))) &&
     Array.isArray(x.usedRefreshHashes) &&
     x.usedRefreshHashes.every(isStr)
   );
@@ -160,8 +167,8 @@ export class OAuthStore {
 
   private index(g: StoredGrant): void {
     this.grantsById.set(g.id, g);
-    if (g.accessHash) this.byAccess.set(g.accessHash, g);
-    if (g.refreshHash) this.byRefresh.set(g.refreshHash, g);
+    for (const a of g.accessTokens) this.byAccess.set(a.hash, g);
+    for (const h of g.refreshHashes) this.byRefresh.set(h, g);
     for (const h of g.usedRefreshHashes) this.byUsedRefresh.set(h, g);
   }
 
@@ -186,10 +193,18 @@ export class OAuthStore {
   registerClient(info: Omit<OAuthClientInformationFull, 'client_id' | 'client_id_issued_at'>): OAuthClientInformationFull {
     if (this.clients.size >= MAX_CLIENTS) this.prune();
     if (this.clients.size >= MAX_CLIENTS) {
-      // Registering grants nothing, so making room by forgetting the oldest client without a grant is safe.
+      // Registering grants nothing, so making room by forgetting the oldest client without a grant is safe,
+      // unless it is recent enough to be mid-sign-in.
       const inUse = new Set([...this.grantsById.values()].map((g) => g.clientId));
-      const oldest = [...this.clients.values()].filter((c) => !inUse.has(c.client_id)).sort((a, b) => a.registeredAt - b.registeredAt)[0];
-      if (!oldest) throw new InvalidClientMetadataError('This server has too many connected clients; revoke one on the Connected clients page first.');
+      const idle = [...this.clients.values()].filter((c) => !inUse.has(c.client_id));
+      const oldest = idle.filter((c) => Date.now() - c.registeredAt >= RECENT_CLIENT_MS).sort((a, b) => a.registeredAt - b.registeredAt)[0];
+      if (!oldest) {
+        throw new InvalidClientMetadataError(
+          idle.length
+            ? 'Too many clients registered in the last few minutes; try again in 15 minutes.'
+            : 'This server has too many connected clients; revoke one on the Connected clients page first.',
+        );
+      }
       this.clients.delete(oldest.client_id);
     }
     const given = info as Partial<OAuthClientInformationFull>;
@@ -227,6 +242,8 @@ export class OAuthStore {
       redirectHost: g.redirectHost,
       createdAt: now,
       expiresAt: expiryMs(g.expiresOn ?? expiryDayFor(this.opts.ttlDays, now)),
+      accessTokens: [],
+      refreshHashes: [],
       usedRefreshHashes: [],
     };
     this.index(grant);
@@ -234,35 +251,23 @@ export class OAuthStore {
     return this.view(grant);
   }
 
-  /** A fresh access and refresh token for a grant, replacing any it had. */
+  /** A fresh access and refresh token for a grant; any refresh token it had stops working. */
   issueTokens(grantId: string): IssuedTokens {
     const g = this.grantsById.get(grantId);
     if (!g || Date.now() >= g.expiresAt) throw new InvalidGrantError('The sign-in has ended; sign in again.');
-    return this.rotate(g);
-  }
-
-  private rotate(g: StoredGrant): IssuedTokens {
-    if (g.accessHash) this.byAccess.delete(g.accessHash);
-    if (g.refreshHash) this.byRefresh.delete(g.refreshHash);
-    const access = randomSecret();
-    const refresh = randomSecret();
-    const now = Date.now();
-    g.accessHash = sha256(access);
-    g.accessExpiresAt = Math.min(now + ACCESS_TOKEN_TTL_MS, g.expiresAt);
-    g.refreshHash = sha256(refresh);
-    this.byAccess.set(g.accessHash, g);
-    this.byRefresh.set(g.refreshHash, g);
-    this.save();
-    return { access_token: access, token_type: 'bearer', expires_in: Math.max(0, Math.floor((g.accessExpiresAt - now) / 1000)), refresh_token: refresh };
+    this.retireRefreshTokens(g);
+    return this.mint(g);
   }
 
   /**
    * Exchanges a refresh token for a new pair. Each refresh token works once;
    * one that comes back after use was copied, so the whole grant is revoked.
    * The exception: the token exchanged last, presented again by its own client
-   * within REFRESH_REUSE_GRACE_MS, gets another new pair, once. The refresh
-   * token it replaces is then counted as used, so if a thief took the grace
-   * pair, the real client's next refresh revokes the grant.
+   * within REFRESH_REUSE_GRACE_MS of that exchange, gets another pair, as often
+   * as it comes (parallel requests may all refresh with it). The refresh tokens
+   * those pairs carry live side by side until one of them is exchanged, which
+   * retires the rest: so if a thief took one, whichever of the two refreshes
+   * second presents a used token and the grant is revoked.
    * Callers handing the tokens out should await flush() first, so a crash
    * right after can't forget the new refresh token.
    */
@@ -275,14 +280,10 @@ export class OAuthStore {
         this.removeGrant(reused);
         throw new InvalidGrantError('The sign-in has ended; sign in again.');
       }
-      const repeat = reused.clientId === clientId && reused.usedRefreshHashes.at(-1) === hash && reused.refreshedAt !== undefined && now - reused.refreshedAt < REFRESH_REUSE_GRACE_MS;
-      if (repeat) {
-        this.opts.logger.warn('refresh token presented again within the grace period; issued a new pair', { client: grantLabel(reused) });
-        // The refresh token being replaced counts as used: if it turns up later, someone holds a copy.
-        // And one repeat ends the grace period, so two holders can't keep trading pairs.
-        if (reused.refreshHash) this.markUsed(reused, reused.refreshHash);
-        delete reused.refreshedAt;
-        return this.rotate(reused);
+      const last = reused.lastRefresh;
+      if (reused.clientId === clientId && last?.hash === hash && now - last.at < REFRESH_REUSE_GRACE_MS) {
+        this.opts.logger.warn('refresh token presented again within the grace period; issued another pair', { client: grantLabel(reused) });
+        return this.mint(reused);
       }
       this.opts.logger.error('refresh token reused', { client: grantLabel(reused), note: 'the grant was revoked; the client must sign in again' });
       this.removeGrant(reused);
@@ -294,12 +295,38 @@ export class OAuthStore {
       this.removeGrant(g);
       throw new InvalidGrantError('The sign-in has ended; sign in again.');
     }
-    g.refreshedAt = now;
-    this.markUsed(g, hash);
-    return this.rotate(g);
+    this.retireRefreshTokens(g);
+    g.lastRefresh = { hash, at: now };
+    return this.mint(g);
+  }
+
+  /** A new access token alongside the live ones, and a new refresh token alongside the live ones. */
+  private mint(g: StoredGrant): IssuedTokens {
+    const access = randomSecret();
+    const refresh = randomSecret();
+    const now = Date.now();
+    const expiresAt = Math.min(now + ACCESS_TOKEN_TTL_MS, g.expiresAt);
+    for (const a of g.accessTokens) if (now >= a.expiresAt) this.byAccess.delete(a.hash);
+    g.accessTokens = g.accessTokens.filter((a) => now < a.expiresAt);
+    const accessHash = sha256(access);
+    g.accessTokens.push({ hash: accessHash, expiresAt });
+    this.byAccess.set(accessHash, g);
+    while (g.accessTokens.length > MAX_LIVE_TOKENS) this.byAccess.delete(g.accessTokens.shift()!.hash);
+    const refreshHash = sha256(refresh);
+    g.refreshHashes.push(refreshHash);
+    this.byRefresh.set(refreshHash, g);
+    while (g.refreshHashes.length > MAX_LIVE_TOKENS) this.markUsed(g, g.refreshHashes.shift()!);
+    this.save();
+    return { access_token: access, token_type: 'bearer', expires_in: Math.max(0, Math.floor((expiresAt - now) / 1000)), refresh_token: refresh };
+  }
+
+  private retireRefreshTokens(g: StoredGrant): void {
+    for (const h of g.refreshHashes) this.markUsed(g, h);
+    g.refreshHashes = [];
   }
 
   private markUsed(g: StoredGrant, hash: string): void {
+    this.byRefresh.delete(hash);
     g.usedRefreshHashes.push(hash);
     this.byUsedRefresh.set(hash, g);
     // Keep the most recent ones; an older copied token is still useless, just not detected as reuse.
@@ -308,9 +335,11 @@ export class OAuthStore {
 
   /** The client behind a valid access token, or undefined. Records the use. */
   verifyAccess(token: string): ClientInfo | undefined {
-    const g = this.byAccess.get(sha256(token));
+    const hash = sha256(token);
+    const g = this.byAccess.get(hash);
     const now = Date.now();
-    if (!g || g.accessExpiresAt === undefined || now >= g.accessExpiresAt || now >= g.expiresAt) return undefined;
+    const expiresAt = g?.accessTokens.find((a) => a.hash === hash)?.expiresAt;
+    if (!g || expiresAt === undefined || now >= expiresAt || now >= g.expiresAt) return undefined;
     g.lastUsedAt = now;
     this.lastUsedDirty = true;
     const client: ClientInfo = { name: grantLabel(g), expiresAt: iso(g.expiresAt), daysLeft: Math.ceil((g.expiresAt - now) / DAY_MS), signIn: true };
@@ -345,8 +374,8 @@ export class OAuthStore {
 
   private removeGrant(g: StoredGrant, save = true): void {
     this.grantsById.delete(g.id);
-    if (g.accessHash) this.byAccess.delete(g.accessHash);
-    if (g.refreshHash) this.byRefresh.delete(g.refreshHash);
+    for (const a of g.accessTokens) this.byAccess.delete(a.hash);
+    for (const h of g.refreshHashes) this.byRefresh.delete(h);
     for (const h of g.usedRefreshHashes) this.byUsedRefresh.delete(h);
     this.warnedOn.delete(g.id);
     if (save) this.save();

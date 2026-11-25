@@ -17,7 +17,7 @@ A client (Grok Bot for weekly checks, Claude Code while writing articles) gets i
 | Sign-in lifetime | Fixed from approval: expires at 00:00 UTC on (approval day + `MCP_AUTH_TOKEN_TTL_DAYS`), the same calculation as `issueToken`. Refreshing never extends it. |
 | Managing access | A "Connected clients" web page behind the same Google sign-in, with Revoke and Revoke all. |
 
-Why this answers the leak question: issuing anything requires a Google sign-in by an allowed account (protected by the owner's Google 2FA) plus a consent click. Nothing stored by a client or on the server can be traded for a new sign-in. A leaked access token lives at most 1 hour; a leaked refresh token is single-use, and its reuse revokes the whole grant (after a 60-second grace period for the client's own retry).
+Why this answers the leak question: issuing anything requires a Google sign-in by an allowed account (protected by the owner's Google 2FA) plus a consent click. Nothing stored by a client or on the server can be traded for a new sign-in. A leaked access token lives at most 1 hour; a leaked refresh token is single-use, and its reuse revokes the whole grant (after a 60-second grace period for the client's own retries).
 
 ## Architecture
 
@@ -55,7 +55,7 @@ Deny or a disallowed email: redirect to the client's `redirect_uri` with `error=
 
 **Access token**: 32 random bytes, valid 1 hour, never past the grant's expiry.
 
-**Refresh token**: 32 random bytes, single-use. Each refresh returns a new access token and a new refresh token and invalidates the old pair. A refresh token that was already used revokes the whole grant and logs an error, with one exception: the refresh token exchanged last, presented again by the same client within 60 seconds of that exchange, gets a new pair once, and logs a warning. The refresh token from the first exchange then counts as used, so if a thief took the repeat, the real client's next refresh revokes the grant. This covers a lost response. New tokens are written to disk before the client receives them (a failed write is logged; the tokens then work until a restart). A refresh on an expired grant returns `invalid_grant`.
+**Refresh token**: 32 random bytes, single-use. Each refresh returns a new access token and a new refresh token; the old refresh token stops working, while earlier access tokens keep working until their own expiry (at most 10 live per grant), so a refresh never cuts off a request already holding one. A refresh token that was already used revokes the whole grant and logs an error, with one exception: the refresh token exchanged last, presented again by the same client within 60 seconds of that exchange, gets another pair each time, and logs a warning. This covers a lost response and parallel requests that all refresh with the same token (the MCP SDK client doesn't serialize refreshes). The refresh tokens from those pairs live side by side (at most 10) until one of them is exchanged, which retires the rest: so if a thief took one, whichever of the thief and the real client refreshes second presents a used token, and the grant is revoked. New tokens are written to disk before the client receives them (a failed write is logged; the tokens then work until a restart). A refresh on an expired grant returns `invalid_grant`.
 
 **Revocation**: `/revoke` (from clients) and the `/clients` page both delete the grant's tokens at once; the next request gets 401.
 
@@ -66,11 +66,11 @@ Deny or a disallowed email: redirect to the client's `redirect_uri` with `error=
 `DATA_DIR/oauth-state.json`, written with the existing atomic `JsonFile`:
 
 - registered clients, grants, and token hashes only (never a token itself), plus the hashes of the grant's last 100 used refresh tokens, for reuse detection;
-- written on every change to clients, grants or tokens, without waiting for the write: if the process crashes in the instant between issuing a new pair and saving, the previous refresh token works once more after the restart (accepted);
+- written on every change to clients, grants or tokens; before tokens are handed out the provider waits for the write, so a crash can't forget a refresh token the client already holds (a failed write is logged, not thrown: the tokens work until a restart);
 - entries that fail validation on load are dropped with a warning; client secrets are never stored, because every registered client is made public (`token_endpoint_auth_method: none`, PKCE required), and only the client fields the server uses are kept; `lastUsedAt` is updated in memory and flushed at most once a minute and at shutdown;
-- registration clean-up: a client with no grant is deleted 24 hours after registering; at most 100 registered clients: when full, the oldest client without a grant is forgotten (registration grants nothing, so this is safe), and a registration is refused only when every client has a grant;
+- registration clean-up: a client with no grant is deleted 24 hours after registering; at most 100 registered clients: when full, the oldest client without a grant is forgotten (registration grants nothing, so this is safe), except one registered in the last 15 minutes, which may be mid-sign-in; a registration is refused only when every client has a grant or is that recent;
 - expired grants are deleted on startup and once a day (the store runs this itself), and are hidden from the Connected clients page as soon as they expire;
-- a file that can't be read or parsed on startup is renamed to `oauth-state.json.corrupt-<timestamp>`, an error is logged, and the server starts with no grants (every client signs in again).
+- a file that isn't valid JSON or isn't in the expected format is renamed to `oauth-state.json.corrupt-<timestamp>`, an error is logged, and the server starts with no grants (every client signs in again); a file that exists but can't be read at all (e.g. permissions) stops the server from starting, because starting empty would overwrite it.
 
 Authorization requests, codes, Google `state`/nonce and `/clients` sessions are in memory only; a restart during a sign-in means retrying it.
 
@@ -115,17 +115,18 @@ Other changes:
 | Disallowed email, or the owner cancels at Google or denies consent | `error=access_denied` to the client's `redirect_uri`; warning logged |
 | Expired or revoked access token | 401, `WWW-Authenticate: Bearer error="invalid_token", resource_metadata="…"` |
 | Grant expired | refresh returns `invalid_grant`; the client starts a new sign-in |
-| Refresh token reused | grant revoked, `invalid_grant`, error logged (a repeat of the last refresh within 60 s gets a new pair instead) |
+| Refresh token reused | grant revoked, `invalid_grant`, error logged (a repeat of the last refresh within 60 s gets another pair instead) |
 | Pending sign-in lost (timeout or restart) | error page asking to start the connection again |
 | Google's code exchange fails (Google down, or a made-up code) | client sign-in: `error=temporarily_unavailable` to the client's `redirect_uri`; clients page: a 502 page |
-| Too many callbacks from one address | 429 page |
-| `oauth-state.json` unreadable | renamed aside, error logged, start empty |
+| Too many callbacks from one address | client sign-in: `error=temporarily_unavailable` to the client's `redirect_uri`; clients page: a 429 page |
+| `oauth-state.json` not valid JSON or wrong format | renamed aside, error logged, start empty |
+| `oauth-state.json` exists but can't be read | the server refuses to start |
 
 ## Testing
 
 Google is replaced by an injected fake ID-token verifier.
 
-- **Store**: expiry dates (00:00 UTC boundary, TTL), access tokens capped at grant expiry, refresh rotation, reuse revoking the grant, the 60-second grace period, client pruning and cap, expired-grant clean-up, corrupt-file handling, and that only hashes reach the file.
+- **Store**: expiry dates (00:00 UTC boundary, TTL), access tokens capped at grant expiry, refresh rotation, reuse revoking the grant, the 60-second grace period (parallel refreshes all get working pairs; a thief holding a sibling is caught), client pruning and cap, expired-grant clean-up, corrupt-file handling, and that only hashes reach the file.
 - **HTTP end to end**: register → authorize → Google callback → consent → `/token` → MCP tool call → refresh → reuse → 401. Rejections: missing or wrong CSRF token, disallowed email, unverified email, mismatched `redirect_uri`, wrong PKCE verifier. Fixed tokens still accepted alongside OAuth.
 - **`/clients`**: sign-in redirect, listing, revoke, revoke all, CSRF rejection, session expiry.
 - **Config**: all-or-nothing rule for the four variables, fixed tokens optional with OAuth on, `MCP_PUBLIC_URL` validation.
