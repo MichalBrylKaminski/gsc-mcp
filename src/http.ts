@@ -1,13 +1,29 @@
-import { createHash, timingSafeEqual } from 'node:crypto';
 import { hostHeaderValidation } from '@modelcontextprotocol/sdk/server/middleware/hostHeaderValidation.js';
 import { StreamableHTTPServerTransport } from '@modelcontextprotocol/sdk/server/streamableHttp.js';
-import express, { type Express, type NextFunction, type Request, type Response } from 'express';
+import express, { type Express, type NextFunction, type Request, type RequestHandler, type Response } from 'express';
+import type { AuthInfo } from '@modelcontextprotocol/sdk/server/auth/types.js';
+import { authInfoFor, type ClientInfo, type TokenRegistry } from './auth.js';
+import { OAUTH_PATHS } from './config.js';
 import type { Logger } from './logger.js';
+import type { OAuthStore } from './oauth/store.js';
 import { buildServer } from './server.js';
 import type { ToolDeps } from './tools/common.js';
 
+/** OAuth sign-in, when configured. */
+export interface HttpOAuth {
+  store: Pick<OAuthStore, 'verifyAccess'>;
+  /** Sent in WWW-Authenticate on every 401, so clients can find the authorization server. */
+  resourceMetadataUrl: string;
+  /** The OAuth endpoints and pages, mounted at the app root. */
+  router?: RequestHandler;
+}
+
 export interface HttpOptions {
-  authToken: string;
+  /** Accepted fixed bearer tokens; each one's name shows in the request logs. */
+  tokens: TokenRegistry;
+  oauth?: HttpOAuth;
+  /** Express "trust proxy": how many reverse proxies sit in front of the app. */
+  trustProxy?: number;
   allowedHosts?: string[];
   /** Where the MCP endpoint is served, e.g. "/mcp" (default) or "/gsc-mcp". */
   mcpPath?: string;
@@ -15,38 +31,81 @@ export interface HttpOptions {
   logger: Logger;
 }
 
-const digest = (s: string) => createHash('sha256').update(s).digest();
-
-/** Constant-time bearer token check (hashing first makes lengths equal). */
-export function bearerAuth(token: string) {
-  const expected = digest(token);
-  return (req: Request, res: Response, next: NextFunction) => {
-    const header = req.headers.authorization ?? '';
-    const match = /^Bearer\s+(.+)$/i.exec(header);
-    if (match && timingSafeEqual(digest(match[1]!.trim()), expected)) return next();
-    res.set('WWW-Authenticate', 'Bearer').status(401).json({ jsonrpc: '2.0', error: { code: -32001, message: 'Unauthorized' }, id: null });
+/**
+ * Bearer token check: a fixed token, or (with OAuth) an access token. The
+ * client's name goes in `res.locals.client`, and in `req.auth`, which the MCP
+ * SDK hands to tool handlers as `authInfo`.
+ */
+export function bearerAuth(tokens: TokenRegistry, logger: Logger, oauth?: Pick<HttpOAuth, 'store' | 'resourceMetadataUrl'>) {
+  const challenge = (error?: string, description?: string) =>
+    [
+      error ? `error="${error}"` : undefined,
+      description ? `error_description="${description}"` : undefined,
+      oauth ? `resource_metadata="${oauth.resourceMetadataUrl}"` : undefined,
+    ]
+      .filter(Boolean)
+      .join(', ');
+  const unauthorized = (res: Response, header: string, message: string) => {
+    res
+      .set('WWW-Authenticate', header ? `Bearer ${header}` : 'Bearer')
+      .status(401)
+      .json({ jsonrpc: '2.0', error: { code: -32001, message }, id: null });
   };
+  return (req: Request & { auth?: AuthInfo }, res: Response, next: NextFunction) => {
+    const match = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? '');
+    const given = match?.[1]!.trim();
+    const result = given !== undefined ? tokens.check(given) : undefined;
+    const client: ClientInfo | undefined = result?.kind === 'ok' ? result.client : result?.kind === 'unknown' ? oauth?.store.verifyAccess(given!) : undefined;
+    if (client) {
+      res.locals.client = client.name;
+      req.auth = authInfoFor(client);
+      return next();
+    }
+    // Never log what was sent; a typo'd token is still mostly a secret.
+    if (result?.kind === 'expired') {
+      logger.warn('unauthorized request', { reason: 'expired token', client: result.name });
+      unauthorized(res, challenge('invalid_token', 'The token has expired'), 'Unauthorized: the token has expired. Ask the server owner for a new one.');
+      return;
+    }
+    logger.warn('unauthorized request', { reason: match ? 'unknown token' : 'no bearer token' });
+    unauthorized(res, match ? (oauth ? challenge('invalid_token') : '') : challenge(), 'Unauthorized');
+  };
+}
+
+/** What a request asks for, for the request log: the JSON-RPC method and, for tool calls, the tool. */
+function describeRequest(body: unknown): { method?: string; tool?: string } {
+  const one = (Array.isArray(body) ? body[0] : body) as { method?: unknown; params?: { name?: unknown } } | undefined;
+  const text = (v: unknown) => (typeof v === 'string' ? v.slice(0, 64) : undefined);
+  return { method: Array.isArray(body) ? 'batch' : text(one?.method), tool: one?.method === 'tools/call' ? text(one.params?.name) : undefined };
 }
 
 const methodNotAllowed = (_req: Request, res: Response) => {
   res.status(405).set('Allow', 'POST').json({ jsonrpc: '2.0', error: { code: -32000, message: 'Method not allowed. This server is stateless; use POST.' }, id: null });
 };
 
-export function createApp({ authToken, allowedHosts, mcpPath = '/mcp', deps, logger }: HttpOptions): Express {
+export function createApp({ tokens, oauth, trustProxy, allowedHosts, mcpPath = '/mcp', deps, logger }: HttpOptions): Express {
   const app = express();
   app.disable('x-powered-by');
+  if (trustProxy !== undefined) app.set('trust proxy', trustProxy);
 
   app.get('/healthz', (_req, res) => {
     res.json({ status: 'ok' });
   });
 
+  // The OAuth endpoints and pages answer only for the allowed hosts too (DNS-rebinding protection).
+  if (oauth?.router) {
+    if (allowedHosts?.length) app.use(OAUTH_PATHS, hostHeaderValidation(allowedHosts));
+    app.use(oauth.router);
+  }
+
   const mcp = express.Router();
   if (allowedHosts?.length) mcp.use(hostHeaderValidation(allowedHosts));
-  mcp.use(bearerAuth(authToken));
+  mcp.use(bearerAuth(tokens, logger, oauth));
   mcp.use(express.json({ limit: '1mb' }));
 
   // Stateless Streamable HTTP: a fresh server and transport per request.
   mcp.post('/', async (req, res) => {
+    logger.info('mcp request', { client: res.locals.client, ...describeRequest(req.body) });
     const server = buildServer(deps);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on('close', () => {

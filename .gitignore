@@ -4,3 +4,4 @@ data/
 secrets/
 .env
 *.log
+docs/superpowers/

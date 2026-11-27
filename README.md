@@ -254,10 +254,16 @@ server {
     location = /healthz {
         proxy_pass http://127.0.0.1:3000;
     }
+    # Only with OAuth sign-in: the sign-in endpoints and pages live at the root of the domain.
+    location ~ ^/(\.well-known/oauth-|register$|authorize$|token$|revoke$|oauth/|clients) {
+        proxy_pass http://127.0.0.1:3000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;   # with TRUST_PROXY=1
+    }
 }
 ```
 
-**Serving under a sub-path.** To publish the endpoint at `https://example.com/gsc-mcp` instead of `/mcp`, set `MCP_PATH=/gsc-mcp` and proxy that path without rewriting it. Health checks stay at `/healthz`.
+**Serving under a sub-path.** To publish the endpoint at `https://example.com/gsc-mcp` instead of `/mcp`, set `MCP_PATH=/gsc-mcp` and proxy that path without rewriting it. Health checks stay at `/healthz`. [OAuth sign-in](#oauth-sign-in) still uses paths at the root of the domain (`/.well-known/…`, `/authorize`, `/clients`, …), so with OAuth only one such server can live on a hostname.
 
 **Cloudflare.** Proxied requests are cut off after 100 seconds. The server stops batch inspections at 90 seconds for this reason, so no extra setting is needed.
 
@@ -360,9 +366,15 @@ To share the server with a project's team instead, commit a `.mcp.json` at the r
 
 Inside a session, `/mcp` shows the server's status and its tools.
 
+**With OAuth sign-in** (if the server has it on), skip the token: add the server without `--header`, then run `/mcp` in a session and choose to authenticate. Your browser opens for the Google sign-in and the consent page; after that, Claude Code renews its tokens by itself.
+
+```bash
+claude mcp add --transport http --scope user gsc https://gsc-mcp.example.com/mcp
+```
+
 ### Claude Desktop
 
-Claude Desktop's custom connectors (Settings → Connectors) support only OAuth, not a fixed bearer token. Instead, connect through the [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) bridge, which needs Node.js. Open Settings → Developer → Edit Config and add this to `claude_desktop_config.json`:
+Claude Desktop's custom connectors (Settings → Connectors), like claude.ai's, support only OAuth, not a fixed bearer token. If the server has [OAuth sign-in](#oauth-sign-in) on, add the endpoint URL there (`https://gsc-mcp.example.com/mcp`) and sign in when asked. With a fixed token, connect through the [`mcp-remote`](https://www.npmjs.com/package/mcp-remote) bridge, which needs Node.js. Open Settings → Developer → Edit Config and add this to `claude_desktop_config.json`:
 
 ```json
 {
@@ -427,9 +439,17 @@ All settings are environment variables. With Docker Compose they go in `.env`.
 
 | Variable | Default | Description |
 |---|---|---|
-| `MCP_AUTH_TOKEN` | **required** | Bearer token clients must send. At least 32 characters; generate with `openssl rand -hex 32` |
+| `MCP_AUTH_TOKEN` | **required**, unless `MCP_AUTH_TOKENS` or [OAuth sign-in](#oauth-sign-in) is set | Bearer token clients must send. At least 32 characters; generate with `openssl rand -hex 32` |
+| `MCP_AUTH_TOKENS` | (none) | More accepted tokens, comma-separated, each as `name:token` (e.g. `grok:3f1c…,claude-code:9ab2…`) or a bare token, optionally followed by an expiry date, `:YYYY-MM-DD`. Names (letters, digits, `_`, `.`, `-`, up to 32) show in the logs. Used together with `MCP_AUTH_TOKEN`. See [Rotating credentials](#rotating-credentials) |
+| `MCP_AUTH_AUTO_EXPIRE` | `false` | `true` makes each token stop working on the date written on it, and requires every token to have one. See [Token expiry](#token-expiry) |
+| `MCP_AUTH_TOKEN_TTL_DAYS` | `90` | How far from today the token generator sets a new token's date, and how long an OAuth sign-in lasts (30–365 days) |
+| `MCP_PUBLIC_URL` | (off) | OAuth sign-in: the server's public address, which is also the OAuth issuer, e.g. `https://gsc-mcp.example.com`. Bare origin only (no path); https, or http on localhost. OAuth is on only when this and the next three are all set. See [OAuth sign-in](#oauth-sign-in) |
+| `GOOGLE_OAUTH_CLIENT_ID` | (off) | OAuth sign-in: the client ID of your Google OAuth client (Web application) |
+| `GOOGLE_OAUTH_CLIENT_SECRET` | (off) | OAuth sign-in: that client's secret. Keep it out of the repository |
+| `MCP_OAUTH_ALLOWED_EMAILS` | (off) | OAuth sign-in: comma-separated Google accounts that may approve clients and open `/clients`, e.g. `you@example.com` (case doesn't matter) |
+| `TRUST_PROXY` | (unset) | Number of reverse proxies in front of the server that append to `X-Forwarded-For` (e.g. `2` for Cloudflare plus nginx), so the sign-in endpoints' rate limits see real client addresses. Never set it higher than the real number, or clients can fake their address, and let the origin accept traffic only from the proxy (e.g. Cloudflare), since a client that reaches it directly can write its own `X-Forwarded-For`. `0` means none (and silences the startup warning OAuth gives when it is unset). nginx must append rather than replace the header: `proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for` (on Dokku: `dokku nginx:set <app> x-forwarded-for-value '$proxy_add_x_forwarded_for'`) |
 | `GOOGLE_APPLICATION_CREDENTIALS` | **required** | Path to the service account JSON key. Docker Compose sets it to the mounted secret |
-| `DATA_DIR` | `./data` (`/data` in Docker) | Writable directory for quota counters and pauses |
+| `DATA_DIR` | `./data` (`/data` in Docker) | Writable directory for quota counters, pauses and, with OAuth, `oauth-state.json` (sign-ins, token hashes only) |
 | `HOST` | `0.0.0.0` | Interface to listen on |
 | `PORT` | `3000` | Port to listen on inside the container or process |
 | `HOST_PORT` | `3000` | Docker Compose only: the port published on the host's `127.0.0.1` |
@@ -472,12 +492,80 @@ Google's published limits ([source](https://developers.google.com/webmaster-tool
 ## Security
 
 - **Read-only access to Google.** The server requests only the `webmasters.readonly` scope. Even a compromised server can't change your Search Console settings.
-- **Bearer token.** Every MCP request needs the token, compared in constant time. Treat it like a password; to rotate it, change `MCP_AUTH_TOKEN`, restart, and update your clients.
+- **Bearer tokens.** Every MCP request needs a valid token, compared in constant time. Treat tokens like passwords. Give each client its own token in `MCP_AUTH_TOKENS`, so you can revoke one without touching the others.
 - **Host check.** Set `ALLOWED_HOSTS` to your domain to reject requests addressed to other hostnames (DNS-rebinding protection).
 - **Property allowlist.** Set `GSC_ALLOWED_SITES` to limit what clients can read, even if the service account has access to more properties.
-- **Key handling.** Keep the key out of the repository (`secrets/` is ignored), readable only by the server's user. If it leaks, delete it in the Cloud console (Service account → Keys) and create a new one.
+- **OAuth sign-in (optional).** Clients such as Claude Code and Grok can get and renew their own credentials: you approve each one by signing in with Google (only the accounts you allow) and clicking Approve. Nothing a client stores can start a new sign-in: a leaked access token expires within an hour, and a refresh token works once, so reusing one revokes the sign-in. See [OAuth sign-in](#oauth-sign-in).
+- **Token expiry (optional).** With `MCP_AUTH_AUTO_EXPIRE=true`, every token carries an expiry date and stops working on it, so rotation is enforced rather than suggested. See [Token expiry](#token-expiry).
+- **Key handling.** Keep the key out of the repository (`secrets/` is ignored), readable only by the server's user. If it leaks, replace it as described below.
 - **Container hardening.** The Compose file binds to `127.0.0.1`, runs as a non-root user with a read-only filesystem, drops all capabilities and sets `no-new-privileges`.
-- **No secrets in logs.** Logs are structured JSON and never include the token or key.
+- **No secrets in logs.** Logs are structured JSON and never include a token or the key. Each MCP request is logged with the name of the token it used (`"client":"grok"`), or a short hash such as `sha256:1a2b3c4d` for unnamed tokens, and rejected requests are logged as `unauthorized request`. That shows which clients still use an old token.
+
+### OAuth sign-in
+
+Optional, and it works alongside the fixed tokens: the server accepts a fixed token or an OAuth access token. With OAuth, a client gets its credentials the first time it connects and renews them by itself:
+
+1. The client calls the MCP endpoint without a token. The `401` tells it where the server's OAuth metadata is (`/.well-known/oauth-protected-resource/<path>`).
+2. It registers itself at `/register` (this alone grants nothing) and opens your browser at `/authorize`.
+3. You sign in with Google. Only verified accounts listed in `MCP_OAUTH_ALLOWED_EMAILS` get further.
+4. A consent page shows which client is asking, where the code will be sent and when access ends. Click **Approve**. This step matters even after the Google sign-in: anyone can register a client and send you a sign-in link, and if you're already signed in to Google, Google may not ask you anything.
+5. The client gets an access token (valid for one hour) and a refresh token. Each refresh gives a new pair, and a refresh token that is used twice is treated as stolen: the whole sign-in is revoked. The one exception covers retries and parallel requests: for 60 seconds after a refresh, the refresh token just used may be sent again for another working pair. Once any of those new refresh tokens is used, the others stop working.
+
+**How long it lasts.** A sign-in ends at 00:00 UTC on the date shown on the consent page: the day you approved it plus `MCP_AUTH_TOKEN_TTL_DAYS` (default 90). Refreshing never extends it. In the last 14 days, tool results carry a `tokenNotice` asking you to reconnect; then the client asks you to sign in again. `MCP_AUTH_AUTO_EXPIRE` applies only to fixed tokens.
+
+**Connected clients.** Open `https://<your server>/clients` and sign in with Google to see every sign-in (client, where codes go, approved, expires, last used) and the fixed tokens. **Revoke** cuts a client off at once; **Revoke all** cuts off every OAuth client, but not fixed tokens.
+
+**Setup, once:**
+
+1. In the Google Cloud project that holds the service account, open **Google Auth Platform** (formerly *APIs & Services → OAuth consent screen*). Under **Branding**, fill in the app name and your email; under **Audience**, choose **External** and add your Google account as a **test user**. You can leave the app in **Testing**: the server only reads your email from Google and keeps no Google tokens, so Testing mode's 7-day token limit doesn't matter and no verification is needed.
+2. Under **Clients**, create a client of type **Web application** and add the authorized redirect URI `https://<your server>/oauth/google/callback`.
+3. Set `MCP_PUBLIC_URL`, `GOOGLE_OAUTH_CLIENT_ID`, `GOOGLE_OAUTH_CLIENT_SECRET`, `MCP_OAUTH_ALLOWED_EMAILS` and, behind proxies, `TRUST_PROXY`, then restart. On Dokku:
+
+   ```bash
+   dokku nginx:set gsc-mcp x-forwarded-for-value '$proxy_add_x_forwarded_for'
+   dokku config:set gsc-mcp MCP_PUBLIC_URL=https://gsc-mcp.example.com GOOGLE_OAUTH_CLIENT_ID=… \
+     GOOGLE_OAUTH_CLIENT_SECRET=… MCP_OAUTH_ALLOWED_EMAILS=you@example.com TRUST_PROXY=2   # 2 = Cloudflare + nginx
+   ```
+
+4. Check: `curl -s https://<your server>/.well-known/oauth-authorization-server` lists the endpoints.
+
+The OAuth endpoints and pages are served at the root of the domain (`/.well-known/…`, `/register`, `/authorize`, `/token`, `/revoke`, `/oauth/…`, `/clients`), so a reverse proxy must pass those paths to the server, not only the MCP path (see the nginx example in [Put it behind HTTPS](#4-put-it-behind-https)). If `ALLOWED_HOSTS` is set, it must include the host of `MCP_PUBLIC_URL`; the server refuses to start otherwise. Only hashes of tokens are stored, in `DATA_DIR/oauth-state.json`; a copy of that file can't be used to call the server. Registered clients are always treated as public clients (PKCE protects the code exchange), so no client secret is stored either.
+
+### Rotating credentials
+
+**A bearer token**, with no downtime (the commands are for Dokku; with Docker Compose, edit `.env` and run `docker compose up -d`):
+
+1. Generate a new token (`node dist/issueToken.js grok-new`, or `openssl rand -hex 32` without auto-expire) and add it next to the old one, e.g. `MCP_AUTH_TOKENS=grok:<old>,grok-new:<new>` (`dokku config:set gsc-mcp MCP_AUTH_TOKENS=...`, which restarts the app).
+2. Switch the client to the new token.
+3. Check the logs (`dokku logs gsc-mcp`) until requests arrive only as `grok-new`.
+4. Remove the old token: `MCP_AUTH_TOKENS=grok:<new>`.
+
+If a token has leaked, skip the waiting: remove it at once, then update the client.
+
+### Token expiry
+
+Off by default. Set `MCP_AUTH_AUTO_EXPIRE=true` to make tokens expire, so a forgotten rotation can't leave a token valid forever:
+
+- **The date on the token is the expiry.** Each entry in `MCP_AUTH_TOKENS` ends with a date, `name:token:YYYY-MM-DD`, and the token stops working at 00:00 UTC that day. Nothing else ends it, and the server keeps no other record. With auto-expire on, the server refuses to start if any token has no date. With it off, dates are ignored.
+- **New tokens get today + TTL.** Create tokens with the generator, which sets the date `MCP_AUTH_TOKEN_TTL_DAYS` (default 90, allowed 30–365) from today:
+
+  ```bash
+  node dist/issueToken.js grok              # in the container: dokku run gsc-mcp node dist/issueToken.js grok
+  # grok:3f1c…9ab2:2027-02-15               (or from a checkout: npm run -s token -- grok)
+  ```
+
+  Add the printed line to `MCP_AUTH_TOKENS` and give the client only the token part.
+- **What clients see.** An expired token gets `401` with "the token has expired", and the log says `expired token` with the client's name. In the last 14 days, every tool result carries a `tokenNotice` the agent can pass on, `get_quota_status` shows the client's `expiresAt` and `daysLeft`, and the log warns once a day per token.
+- **Rotating in time.** Use the routine above with a freshly generated token: add it, switch the client, remove the old one.
+
+**The service account key:**
+
+1. In the Cloud console, open the service account → Keys → Add key → Create new key → JSON. A service account can have up to 10 keys, so the old one keeps working meanwhile.
+2. Replace the key file on the server (keep its owner and permissions) and restart the server.
+3. Check that a tool call works, e.g. `list_sites`.
+4. Delete the old key in the Cloud console. If you're in a Google Cloud organization, the `iam.serviceAccountKeyExpiryHours` policy can make keys expire on their own.
+
+**An extra layer (optional).** Behind Cloudflare, a [Cloudflare Access service token](https://developers.cloudflare.com/cloudflare-one/identity/service-tokens/) or a WAF rule limited to your clients' IP addresses means a leaked bearer token alone isn't enough. With OAuth sign-in, leave the paths listed in [OAuth sign-in](#oauth-sign-in) open: your browser uses `/authorize`, `/oauth/…` and `/clients`, and the clients themselves call `/.well-known/…`, `/register`, `/token` and `/revoke`, so an IP rule must allow both, and a service token in front of them breaks OAuth clients.
 
 ## Updating
 
